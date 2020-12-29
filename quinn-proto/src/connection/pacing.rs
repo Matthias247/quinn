@@ -28,7 +28,7 @@ impl Pacer {
         self.tokens = self.tokens.saturating_sub(packet_length.into())
     }
 
-    /// Return how long we need to wait before sending a packet.
+    /// Return how long we need to wait before sending `bytes_to_send`
     ///
     /// If we can send a packet right away, this returns `None`. Otherwise, returns `Some(d)`,
     /// where `d` is the time before this function should be called again.
@@ -38,7 +38,7 @@ impl Pacer {
     pub fn delay(
         &mut self,
         smoothed_rtt: Duration,
-        mtu: u16,
+        bytes_to_send: u64,
         window: u64,
         now: Instant,
     ) -> Option<Instant> {
@@ -48,7 +48,7 @@ impl Pacer {
         );
 
         // if we can already send a packet, there is no need for delay
-        if self.tokens > mtu.into() {
+        if self.tokens > bytes_to_send {
             return None;
         }
 
@@ -75,13 +75,13 @@ impl Pacer {
             .saturating_add(new_tokens as _)
             .min(self.capacity);
 
-        // if we can already send a packet, there is no need for delay
-        if self.tokens > mtu.into() {
+        // if we can send packets, there is no need for delay
+        if self.tokens > bytes_to_send {
             return None;
         }
 
         let unscaled_delay = smoothed_rtt
-            .checked_mul(((mtu as u64).max(self.capacity) - self.tokens) as _)
+            .checked_mul((bytes_to_send.max(self.capacity) - self.tokens) as _)
             .unwrap_or_else(|| Duration::new(u64::max_value(), 999_999_999))
             / window;
 
