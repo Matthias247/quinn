@@ -296,6 +296,21 @@ fn prepare_msg(
     } else {
         encoder.push(libc::IPPROTO_IPV6, libc::IPV6_TCLASS, ecn);
     }
+
+    if let Some(segment_size) = transmit.segment_size {
+        #[cfg(target_os = "linux")]
+        fn set_segment_size(encoder: &mut cmsg::Encoder, segment_size: u16) {
+            encoder.push(libc::SOL_UDP, libc::UDP_SEGMENT, segment_size);
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        fn set_segment_size(encoder: &mut cmsg::Encoder, segment_size: u16) {
+            panic!("Setting a segment size is not supported on current platform");
+        }
+
+        set_segment_size(&mut encoder, segment_size as u16);
+    }
+
     encoder.finish();
 }
 
