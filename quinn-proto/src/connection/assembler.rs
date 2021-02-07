@@ -153,9 +153,9 @@ impl Assembler {
         // of memory allocated. In the worst case scenario of 32 1-byte chunks,
         // each one from a ~1000-byte datagram, using 32 limits us to having a
         // maximum pathological over-allocation of about 32k bytes.
-        if self.data.len() - self.defragmented > 32 {
-            self.defragment()
-        }
+        // if self.data.len() - self.defragmented > 32 {
+        //     self.defragment()
+        // }
     }
 
     pub(crate) fn set_bytes_read(&mut self, new: u64) {
