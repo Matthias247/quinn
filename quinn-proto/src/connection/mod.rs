@@ -23,7 +23,7 @@ use crate::{
     frame::{Close, Datagram, FrameStruct},
     is_supported_version,
     packet::{Header, LongType, Packet, PacketNumber, PartialDecode, PartialEncode, SpaceId},
-    range_set::RangeSet,
+    range_set::CompactRangeSet,
     shared::{
         ConnectionEvent, ConnectionEventInner, ConnectionId, EcnCodepoint, EndpointEvent,
         EndpointEventInner, IssuedCid,
@@ -346,7 +346,7 @@ where
     #[must_use]
     pub fn poll_transmit(&mut self, now: Instant) -> Option<Transmit> {
         // This will become a parameter to `poll_transmit` in an additional update
-        const MAX_DATAGRAMS: usize = 1;
+        const MAX_DATAGRAMS: usize = 8;
 
         let mut num_datagrams = 0;
 
@@ -3606,7 +3606,7 @@ struct ZeroRttCrypto<S: crypto::Session> {
 #[derive(Default)]
 struct SentFrames {
     retransmits: ThinRetransmits,
-    acks: RangeSet,
+    acks: CompactRangeSet,
     stream_frames: StreamMetaVec,
     padding: bool,
     requires_padding: bool,

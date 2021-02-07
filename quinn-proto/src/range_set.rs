@@ -1,12 +1,496 @@
+use tinyvec::TinyVec;
 use std::{
     cmp,
     cmp::Ordering,
     collections::{
         btree_map, BTreeMap,
         Bound::{Excluded, Included},
+        VecDeque,
     },
     ops::Range,
 };
+
+// /// A set of u64 values optimized for long runs and random insert/delete/contains
+// #[derive(Debug, Default, Clone)]
+// pub struct CompactRangeSet(VecDeque<Range<u64>>);
+
+// pub struct CompactRangeSetIter<'a> {
+//     inner: &'a VecDeque<Range<u64>>,
+//     front_idx: usize,
+//     back_idx: usize,
+// }
+
+// impl<'a> Iterator for CompactRangeSetIter<'a> {
+//     type Item = Range<u64>;
+
+//     fn next(&mut self) -> Option<Self::Item> {
+//         if self.front_idx == self.back_idx {
+//             None
+//         } else {
+//             let elem = self.inner.get(self.front_idx).cloned();
+//             self.front_idx += 1;
+//             elem
+//         }
+//     }
+// }
+
+// impl<'a> DoubleEndedIterator for CompactRangeSetIter<'a> {
+//     fn next_back(&mut self) -> Option<Self::Item> {
+//         if self.back_idx == self.front_idx {
+//             None
+//         } else {
+//             self.back_idx -= 1;
+//             self.inner.get(self.back_idx).cloned()
+//         }
+//     }
+// }
+
+// pub struct CompactEltIter<'a> {
+//     inner: CompactRangeSetIter<'a>,
+//     start: u64,
+//     end: u64,
+// }
+
+// impl<'a> Iterator for CompactEltIter<'a> {
+//     type Item = u64;
+//     fn next(&mut self) -> Option<u64> {
+//         if self.start == self.end {
+//             let next_range = self.inner.next()?;
+//             self.start = next_range.start;
+//             self.end = next_range.end;
+//         }
+//         let x = self.start;
+//         self.start += 1;
+//         Some(x)
+//     }
+// }
+
+// fn intersect(a: Range<u64>, b: Range<u64>) -> Range<u64> {
+//     if a.start > b.end || b.start > a.end {
+//         return 0..0;
+//     }
+
+//     let start = a.start.max(b.start);
+//     let end = a.end.min(b.end);
+
+//     if start > end {
+//         0 .. 0
+//     } else {
+//         start .. end
+//     }
+// }
+
+// impl CompactRangeSet {
+//     pub fn new() -> Self {
+//         Default::default()
+//     }
+
+//     pub fn iter(&self) -> CompactRangeSetIter<'_> {
+//         CompactRangeSetIter {
+//             inner: &self.0,
+//             front_idx: 0,
+//             back_idx: self.0.len(),
+//         }
+//     }
+
+//     pub fn elts(&self) -> CompactEltIter<'_> {
+//         CompactEltIter {
+//             inner: self.iter(),
+//             start: 0,
+//             end: 0,
+//         }
+//     }
+
+//     pub fn len(&self) -> usize {
+//         self.0.len()
+//     }
+
+//     pub fn contains(&self, x: u64) -> bool {
+//         self.0.iter().any(|range|range.contains(&x))
+//     }
+
+//     pub fn subtract(&mut self, other: &CompactRangeSet) {
+//         for range in &other.0 {
+//             self.remove(range.clone());
+//         }
+//     }
+
+//     pub fn insert_one(&mut self, x: u64) -> bool {
+//         let mut idx = 0;
+//         while idx != self.0.len() {
+//             let range = &mut self.0[idx];
+
+//             if x + 1 == range.start {
+//                 // Extend the range to the left
+//                 // Note that we don't have to merge the left range, since
+//                 // this case would have been captured by merging the right range
+//                 // in the previous loop iteration
+//                 range.start = x;
+//                 return true;
+//             } else if x < range.start {
+//                 // Not extensible. Add a new range to the left
+//                 self.0.insert(idx, x .. x + 1);
+//                 return true;
+//             } else if x >= range.start && x < range.end {
+//                 // Fully contained
+//                 return false;
+//             } else if x == range.end {
+//                 // Extend the range to the end
+//                 range.end += 1;
+
+//                 // Merge the next range
+//                 if idx != self.0.len() - 1 {
+//                     let curr = self.0[idx].clone();
+//                     let next = self.0[idx + 1].clone();
+//                     if curr.end == next.start {
+//                         self.0[idx].end = next.end;
+//                         self.0.remove(idx + 1);
+//                     }
+//                 }
+
+//                 return true;
+//             }
+
+//             idx += 1;
+//         }
+
+//         self.0.push_back(x .. x + 1);
+//         true
+//     }
+
+//     #[cfg(test)]
+//     pub fn insert(&mut self, x: Range<u64>) -> bool {
+//         let mut result = false;
+//         for v in x {
+//             result |= self.insert_one(v);
+//         }
+
+//         assert!(self.0.len() < 100);
+
+//         result
+//     }
+
+//     pub fn remove(&mut self, mut x: Range<u64>) -> bool {
+//         let mut result = false;
+
+//         let mut idx = 0;
+//         while idx != self.0.len() && x.start != x.end {
+//             let range = self.0[idx].clone();
+
+//             if x.end <= range.start {
+//                 // The range is fully before this range
+//                 return result;
+//             } else if x.start >= range.end {
+//                 // The range is fully after this range
+//                 idx += 1;
+//             } else {
+//                 // The range overlaps with this range
+//                 result = true;
+
+//                 // Trim everything off the range which is in front of this range
+//                 x.start = x.start.max(range.start);
+
+//                 // This is what we remove from this particular range
+//                 let to_remove = x.start .. x.end.min(range.end);
+
+//                 // Everything which is after thing range will be handled in the
+//                 // next loop iteration
+//                 x.start = range.end.min(x.end);
+
+//                 debug_assert!(range.start <= to_remove.start);
+//                 debug_assert!(to_remove.end <= range.end);
+
+//                 let left = range.start .. to_remove.start;
+//                 let right = to_remove.end .. range.end;
+
+//                 let left_len = left.end - left.start;
+//                 let right_len= right.end - right.start;
+
+//                 debug_assert!(left_len + right_len <= range.end - range.start);
+
+//                 if left_len == 0 && right_len == 0 {
+//                     // We drained the range
+//                     self.0.remove(idx);
+//                 } else if left_len != 0 && right_len != 0 {
+//                     self.0[idx] = right;
+//                     self.0.insert(idx, left);
+//                     idx += 2;
+//                 } else if left_len != 0 {
+//                     self.0[idx] = left;
+//                     idx += 1;
+//                 } else {
+//                     self.0[idx] = right;
+//                     idx += 1;
+//                 }
+//             }
+//         }
+
+//         result
+//     }
+
+//     pub fn is_empty(&self) -> bool {
+//         self.0.is_empty()
+//     }
+
+//     pub fn pop_min(&mut self) -> Option<Range<u64>> {
+//         self.0.pop_front()
+//     }
+// }
+
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+struct MyRange {
+    start: u64,
+    end: u64,
+}
+
+impl Into<Range<u64>> for MyRange {
+    fn into(self) -> Range<u64> {
+        Range {
+            start: self.start,
+            end: self.end,
+        }
+    }
+}
+
+impl From<Range<u64>> for MyRange {
+    fn from(r: Range<u64>) -> Self {
+        Self {
+            start: r.start,
+            end: r.end,
+        }
+    }
+}
+
+/// A set of u64 values optimized for long runs and random insert/delete/contains
+#[derive(Debug, Clone, Default)]
+pub struct CompactRangeSet(TinyVec<[Range<u64>; 2]>);
+
+pub struct CompactRangeSetIter<'a> {
+    inner: &'a TinyVec<[Range<u64>; 2]>,
+    front_idx: usize,
+    back_idx: usize,
+}
+
+impl<'a> Iterator for CompactRangeSetIter<'a> {
+    type Item = Range<u64>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.front_idx == self.back_idx {
+            None
+        } else {
+            let elem = self.inner.get(self.front_idx).cloned();
+            self.front_idx += 1;
+            elem
+        }
+    }
+}
+
+impl<'a> DoubleEndedIterator for CompactRangeSetIter<'a> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.back_idx == self.front_idx {
+            None
+        } else {
+            self.back_idx -= 1;
+            self.inner.get(self.back_idx).cloned()
+        }
+    }
+}
+
+pub struct CompactEltIter<'a> {
+    inner: CompactRangeSetIter<'a>,
+    start: u64,
+    end: u64,
+}
+
+impl<'a> Iterator for CompactEltIter<'a> {
+    type Item = u64;
+    fn next(&mut self) -> Option<u64> {
+        if self.start == self.end {
+            let next_range = self.inner.next()?;
+            self.start = next_range.start;
+            self.end = next_range.end;
+        }
+        let x = self.start;
+        self.start += 1;
+        Some(x)
+    }
+}
+
+fn intersect(a: Range<u64>, b: Range<u64>) -> Range<u64> {
+    if a.start > b.end || b.start > a.end {
+        return 0..0;
+    }
+
+    let start = a.start.max(b.start);
+    let end = a.end.min(b.end);
+
+    if start > end {
+        0..0
+    } else {
+        start..end
+    }
+}
+
+impl CompactRangeSet {
+    pub fn new() -> Self {
+        Default::default()
+    }
+
+    pub fn iter(&self) -> CompactRangeSetIter<'_> {
+        CompactRangeSetIter {
+            inner: &self.0,
+            front_idx: 0,
+            back_idx: self.0.len(),
+        }
+    }
+
+    pub fn elts(&self) -> CompactEltIter<'_> {
+        CompactEltIter {
+            inner: self.iter(),
+            start: 0,
+            end: 0,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn contains(&self, x: u64) -> bool {
+        self.0.iter().any(|range| range.contains(&x))
+    }
+
+    pub fn subtract(&mut self, other: &CompactRangeSet) {
+        for range in &other.0 {
+            self.remove(range.clone());
+        }
+    }
+
+    pub fn insert_one(&mut self, x: u64) -> bool {
+        let mut idx = 0;
+        while idx != self.0.len() {
+            let range = &mut self.0[idx];
+
+            if x + 1 == range.start {
+                // Extend the range to the left
+                // Note that we don't have to merge the left range, since
+                // this case would have been captured by merging the right range
+                // in the previous loop iteration
+                range.start = x;
+                return true;
+            } else if x < range.start {
+                // Not extensible. Add a new range to the left
+                self.0.insert(idx, x..x + 1);
+                return true;
+            } else if x >= range.start && x < range.end {
+                // Fully contained
+                return false;
+            } else if x == range.end {
+                // Extend the range to the end
+                range.end += 1;
+
+                // Merge the next range
+                if idx != self.0.len() - 1 {
+                    let curr = self.0[idx].clone();
+                    let next = self.0[idx + 1].clone();
+                    if curr.end == next.start {
+                        self.0[idx].end = next.end;
+                        self.0.remove(idx + 1);
+                    }
+                }
+
+                return true;
+            }
+
+            idx += 1;
+        }
+
+        self.0.push(x..x + 1);
+        true
+    }
+
+    #[cfg(test)]
+    pub fn insert(&mut self, x: Range<u64>) -> bool {
+        let mut result = false;
+        for v in x {
+            result |= self.insert_one(v);
+        }
+
+        assert!(self.0.len() < 100);
+
+        result
+    }
+
+    pub fn remove(&mut self, mut x: Range<u64>) -> bool {
+        let mut result = false;
+
+        let mut idx = 0;
+        while idx != self.0.len() && x.start != x.end {
+            let range = self.0[idx].clone();
+
+            if x.end <= range.start {
+                // The range is fully before this range
+                return result;
+            } else if x.start >= range.end {
+                // The range is fully after this range
+                idx += 1;
+            } else {
+                // The range overlaps with this range
+                result = true;
+
+                // Trim everything off the range which is in front of this range
+                x.start = x.start.max(range.start);
+
+                // This is what we remove from this particular range
+                let to_remove = x.start..x.end.min(range.end);
+
+                // Everything which is after thing range will be handled in the
+                // next loop iteration
+                x.start = range.end.min(x.end);
+
+                debug_assert!(range.start <= to_remove.start);
+                debug_assert!(to_remove.end <= range.end);
+
+                let left = range.start..to_remove.start;
+                let right = to_remove.end..range.end;
+
+                let left_len = left.end - left.start;
+                let right_len = right.end - right.start;
+
+                debug_assert!(left_len + right_len <= range.end - range.start);
+
+                if left_len == 0 && right_len == 0 {
+                    // We drained the range
+                    self.0.remove(idx);
+                } else if left_len != 0 && right_len != 0 {
+                    self.0[idx] = right;
+                    self.0.insert(idx, left);
+                    idx += 2;
+                } else if left_len != 0 {
+                    self.0[idx] = left;
+                    idx += 1;
+                } else {
+                    self.0[idx] = right;
+                    idx += 1;
+                }
+            }
+        }
+
+        result
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn pop_min(&mut self) -> Option<Range<u64>> {
+        if self.0.len() > 0 {
+            Some(self.0.remove(0))
+        } else {
+            None
+        }
+    }
+}
 
 /// A set of u64 values optimized for long runs and random insert/delete/contains
 #[derive(Debug, Default, Clone)]
@@ -463,6 +947,165 @@ mod tests {
     #[test]
     fn skip_empty_ranges() {
         let mut set = RangeSet::new();
+        assert!(!set.insert(2..2));
+        assert_eq!(set.len(), 0);
+        assert!(!set.insert(4..4));
+        assert_eq!(set.len(), 0);
+        assert!(!set.insert(0..0));
+        assert_eq!(set.len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod compact_tests {
+    use super::*;
+
+    #[test]
+    fn merge_and_split() {
+        let mut set = CompactRangeSet::new();
+        assert!(set.insert(0..2));
+        assert!(set.insert(2..4));
+        assert!(!set.insert(1..3));
+        assert_eq!(set.len(), 1);
+        assert_eq!(&set.elts().collect::<Vec<_>>()[..], [0, 1, 2, 3]);
+        assert!(!set.contains(4));
+        assert!(set.remove(2..3));
+        assert_eq!(set.len(), 2);
+        assert!(!set.contains(2));
+        assert_eq!(&set.elts().collect::<Vec<_>>()[..], [0, 1, 3]);
+    }
+
+    #[test]
+    fn double_merge_exact() {
+        let mut set = CompactRangeSet::new();
+        assert!(set.insert(0..2));
+        assert!(set.insert(4..6));
+        assert_eq!(set.len(), 2);
+        assert!(set.insert(2..4));
+        assert_eq!(set.len(), 1);
+        assert_eq!(&set.elts().collect::<Vec<_>>()[..], [0, 1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn single_merge_low() {
+        let mut set = CompactRangeSet::new();
+        assert!(set.insert(0..2));
+        assert!(set.insert(4..6));
+        assert_eq!(set.len(), 2);
+        assert!(set.insert(2..3));
+        assert_eq!(set.len(), 2);
+        assert_eq!(&set.elts().collect::<Vec<_>>()[..], [0, 1, 2, 4, 5]);
+    }
+
+    #[test]
+    fn single_merge_high() {
+        let mut set = CompactRangeSet::new();
+        assert!(set.insert(0..2));
+        assert!(set.insert(4..6));
+        assert_eq!(set.len(), 2);
+        assert!(set.insert(3..4));
+        assert_eq!(set.len(), 2);
+        assert_eq!(&set.elts().collect::<Vec<_>>()[..], [0, 1, 3, 4, 5]);
+    }
+
+    #[test]
+    fn double_merge_wide() {
+        let mut set = CompactRangeSet::new();
+        assert!(set.insert(0..2));
+        assert!(set.insert(4..6));
+        assert_eq!(set.len(), 2);
+        assert!(set.insert(1..5));
+        assert_eq!(set.len(), 1);
+        assert_eq!(&set.elts().collect::<Vec<_>>()[..], [0, 1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn double_remove() {
+        let mut set = CompactRangeSet::new();
+        assert!(set.insert(0..2));
+        assert!(set.insert(4..6));
+        assert!(set.remove(1..5));
+        assert_eq!(set.len(), 2);
+        assert_eq!(&set.elts().collect::<Vec<_>>()[..], [0, 5]);
+    }
+
+    #[test]
+    fn insert_multiple() {
+        let mut set = CompactRangeSet::new();
+        assert!(set.insert(0..1));
+        assert!(set.insert(2..3));
+        assert!(set.insert(4..5));
+        assert!(set.insert(0..5));
+        assert_eq!(set.len(), 1);
+    }
+
+    #[test]
+    fn remove_multiple() {
+        let mut set = CompactRangeSet::new();
+        assert!(set.insert(0..1));
+        assert!(set.insert(2..3));
+        assert!(set.insert(4..5));
+        assert!(set.remove(0..5));
+        assert!(set.is_empty());
+    }
+
+    // #[test]
+    // fn replace_contained() {
+    //     let mut set = CompactRangeSet::new();
+    //     set.insert(2..4);
+    //     assert_eq!(set.replace(1..5).collect::<Vec<_>>(), &[2..4]);
+    //     assert_eq!(set.len(), 1);
+    //     assert_eq!(set.peek_min().unwrap(), 1..5);
+    // }
+
+    // #[test]
+    // fn replace_contains() {
+    //     let mut set = CompactRangeSet::new();
+    //     set.insert(1..5);
+    //     assert_eq!(set.replace(2..4).collect::<Vec<_>>(), &[2..4]);
+    //     assert_eq!(set.len(), 1);
+    //     assert_eq!(set.peek_min().unwrap(), 1..5);
+    // }
+
+    // #[test]
+    // fn replace_pred() {
+    //     let mut set = CompactRangeSet::new();
+    //     set.insert(2..4);
+    //     assert_eq!(set.replace(3..5).collect::<Vec<_>>(), &[3..4]);
+    //     assert_eq!(set.len(), 1);
+    //     assert_eq!(set.peek_min().unwrap(), 2..5);
+    // }
+
+    // #[test]
+    // fn replace_succ() {
+    //     let mut set = CompactRangeSet::new();
+    //     set.insert(2..4);
+    //     assert_eq!(set.replace(1..3).collect::<Vec<_>>(), &[2..3]);
+    //     assert_eq!(set.len(), 1);
+    //     assert_eq!(set.peek_min().unwrap(), 1..4);
+    // }
+
+    // #[test]
+    // fn replace_exact_pred() {
+    //     let mut set = CompactRangeSet::new();
+    //     set.insert(2..4);
+    //     assert_eq!(set.replace(4..6).collect::<Vec<_>>(), &[]);
+    //     assert_eq!(set.len(), 1);
+    //     assert_eq!(set.peek_min().unwrap(), 2..6);
+    // }
+
+    // #[test]
+    // fn replace_exact_succ() {
+    //     let mut set = CompactRangeSet::new();
+    //     set.insert(2..4);
+    //     assert_eq!(set.replace(0..2).collect::<Vec<_>>(), &[]);
+    //     assert_eq!(set.len(), 1);
+    //     assert_eq!(set.peek_min().unwrap(), 0..4);
+    // }
+
+    #[test]
+    fn skip_empty_ranges() {
+        let mut set = CompactRangeSet::new();
         assert!(!set.insert(2..2));
         assert_eq!(set.len(), 0);
         assert!(!set.insert(4..4));
