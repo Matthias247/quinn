@@ -7,15 +7,11 @@ use bytes::Bytes;
 /// The purpose of this data type is to defer conversion as long as possible,
 /// so that no heap allocation is required in case no data is writable.
 pub trait BytesSource {
-    /// Limits the source to the new size
-    fn limit(&mut self, new_len: usize);
-    /// The amount of bytes and chunks consumed from this source
-    fn consumed(&self) -> Written;
     /// Returns the next chunk from the source of owned chunks.
     ///
     /// This method will consume parts of the source.
     // Calling it will yield `Bytes` elements up to the configured `limit`.
-    fn pop_chunk(&mut self) -> Option<Bytes>;
+    fn pop_chunk(&mut self, limit: usize) -> Option<Bytes>;
 }
 
 /// Indicates how many bytes and chunks had been transferred in a write operation
@@ -54,15 +50,7 @@ impl<'a> BytesArray<'a> {
 }
 
 impl<'a> BytesSource for BytesArray<'a> {
-    fn limit(&mut self, new_len: usize) {
-        self.len = self.len.min(new_len);
-    }
-
-    fn consumed(&self) -> Written {
-        self.consumed
-    }
-
-    fn pop_chunk(&mut self) -> Option<Bytes> {
+    fn pop_chunk(&mut self, limit: usize) -> Option<Bytes> {
         // The loop exists to skip empty chunks while still marking them as
         // consumed
         while self.consumed.chunks < self.chunks.len() {
@@ -117,15 +105,7 @@ impl<'a> ByteSlice<'a> {
 }
 
 impl<'a> BytesSource for ByteSlice<'a> {
-    fn limit(&mut self, new_len: usize) {
-        self.len = self.len.min(new_len);
-    }
-
-    fn consumed(&self) -> Written {
-        self.consumed
-    }
-
-    fn pop_chunk(&mut self) -> Option<Bytes> {
+    fn pop_chunk(&mut self, limit: usize) -> Option<Bytes> {
         if self.len == 0 {
             return None;
         }

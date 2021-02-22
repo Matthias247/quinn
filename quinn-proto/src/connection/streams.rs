@@ -17,7 +17,7 @@ use crate::{
     connection::stats::FrameStats,
     frame::{self, FrameStruct, StreamMetaVec},
     transport_parameters::TransportParameters,
-    Dir, Side, StreamId, TransportError, VarInt, MAX_STREAM_COUNT,
+    Dir, Side, StreamId, TransportError, VarInt, Written, MAX_STREAM_COUNT,
 };
 
 mod recv;
@@ -259,7 +259,7 @@ impl Streams {
         &mut self,
         id: StreamId,
         source: &mut S,
-    ) -> Result<(), WriteError> {
+    ) -> Result<Written, WriteError> {
         let limit = (self.max_data - self.data_sent).min(self.send_window - self.unacked_data);
         let stream = self.send.get_mut(&id).ok_or(WriteError::UnknownStream)?;
         if limit == 0 {
@@ -272,16 +272,14 @@ impl Streams {
         }
 
         let was_pending = stream.is_pending();
-        source.limit(limit as usize);
-        stream.write(source)?;
-        let consumed = source.consumed().bytes as u64;
-        self.data_sent += consumed;
-        self.unacked_data += consumed;
-        trace!(stream = %id, "wrote {} bytes", consumed);
+        let written = stream.write(source, limit)?;
+        self.data_sent += written.bytes as u64;
+        self.unacked_data += written.bytes as u64;
+        trace!(stream = %id, "wrote {} bytes", written.bytes);
         if !was_pending {
             push_pending(&mut self.pending, id, stream.priority);
         }
-        Ok(())
+        Ok(written)
     }
 
     /// Process incoming stream frame

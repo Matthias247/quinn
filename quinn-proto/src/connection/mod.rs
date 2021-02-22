@@ -950,8 +950,7 @@ where
     /// Returns the number of bytes successfully written.
     pub fn write(&mut self, stream: StreamId, data: &[u8]) -> Result<usize, WriteError> {
         let mut source = ByteSlice::from_slice(data);
-        self.write_source(stream, &mut source)?;
-        Ok(source.consumed().bytes)
+        Ok(self.write_source(stream, &mut source)?.bytes)
     }
 
     /// Send data on the given stream
@@ -966,15 +965,14 @@ where
         data: &mut [Bytes],
     ) -> Result<Written, WriteError> {
         let mut source = BytesArray::from_chunks(data);
-        self.write_source(stream, &mut source)?;
-        Ok(source.consumed())
+        Ok(self.write_source(stream, &mut source)?)
     }
 
     fn write_source<B: BytesSource>(
         &mut self,
         stream: StreamId,
         data: &mut B,
-    ) -> Result<(), WriteError> {
+    ) -> Result<Written, WriteError> {
         assert!(stream.dir() == Dir::Bi || stream.initiator() == self.side);
         if self.state.is_closed() {
             trace!(%stream, "write blocked; connection draining");
