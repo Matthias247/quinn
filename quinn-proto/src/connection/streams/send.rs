@@ -1,7 +1,9 @@
 use thiserror::Error;
 
 use super::ShouldTransmit;
-use crate::{bytes_source::BytesSource, connection::send_buffer::SendBuffer, frame, VarInt, Written};
+use crate::{
+    bytes_source::BytesSource, connection::send_buffer::SendBuffer, frame, VarInt, Written,
+};
 
 #[derive(Debug)]
 pub(super) struct Send {
@@ -52,7 +54,11 @@ impl Send {
         }
     }
 
-    pub(super) fn write<S: BytesSource>(&mut self, source: &mut S, limit: u64) -> Result<Written, WriteError> {
+    pub(super) fn write<S: BytesSource>(
+        &mut self,
+        source: &mut S,
+        limit: u64,
+    ) -> Result<Written, WriteError> {
         if !self.is_writable() {
             return Err(WriteError::UnknownStream);
         }
@@ -66,11 +72,19 @@ impl Send {
         let mut limit = limit.min(budget) as usize;
 
         let mut result = Written::default();
-        while let Some((chunk, written)) = source.pop_chunk(limit) {
-            result.bytes += written.bytes;
-            result.chunks += written.chunks;
-            limit -= written.bytes;
-            self.pending.write(chunk);
+        loop {
+            match source.pop_chunk(limit) {
+                (Some(chunk), chunks_consumed) => {
+                    result.chunks += chunks_consumed;
+                    result.bytes += chunk.len();
+                    limit -= chunk.len();
+                    self.pending.write(chunk);
+                }
+                (None, chunks_consumed) => {
+                    result.chunks += chunks_consumed;
+                    break;
+                }
+            }
         }
 
         Ok(result)

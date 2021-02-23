@@ -11,11 +11,15 @@ pub trait BytesSource {
     ///
     /// This method will consume parts of the source.
     /// Calling it will yield `Bytes` elements up to the configured `limit`.
-    /// The method will return how many chunks from the source had been consumed
-    /// by this action.
-    /// Those can be more than 1, in case a zero-length chunk inside the source
-    /// was skipped.
-    fn pop_chunk(&mut self, limit: usize) -> Option<(Bytes, Written)>;
+    ///
+    /// The method returns a tuple:
+    /// - The first item is the yielded `Bytes` element, or `None` if the limit
+    ///   is zero or no data is available.
+    /// - The second item returns how many complete chunks inside the source had
+    ///   had been consumed. This can be less than 1, if a chunk inside the
+    ///   source had been truncated in order to adhere to the limit. It can also
+    ///   be more than 1, if zero-length chunks had been skipped.
+    fn pop_chunk(&mut self, limit: usize) -> (Option<Bytes>, usize);
 }
 
 /// Indicates how many bytes and chunks had been transferred in a write operation
@@ -50,10 +54,10 @@ impl<'a> BytesArray<'a> {
 }
 
 impl<'a> BytesSource for BytesArray<'a> {
-    fn pop_chunk(&mut self, limit: usize) -> Option<(Bytes, Written)> {
+    fn pop_chunk(&mut self, limit: usize) -> (Option<Bytes>, usize) {
         // The loop exists to skip empty chunks while still marking them as
         // consumed
-        let mut written = Written::default();
+        let mut chunks_consumed = 0;
 
         while self.consumed < self.chunks.len() {
             let chunk = &mut self.chunks[self.consumed];
@@ -61,25 +65,20 @@ impl<'a> BytesSource for BytesArray<'a> {
             if chunk.len() <= limit {
                 let chunk = std::mem::take(chunk);
                 self.consumed += 1;
-                written.chunks += 1;
+                chunks_consumed += 1;
                 if chunk.is_empty() {
                     continue;
                 }
-                written.bytes += chunk.len();
-                return Some((chunk, written));
+                return (Some(chunk), chunks_consumed);
             } else if limit > 0 {
                 let chunk = chunk.split_to(limit);
-                written.bytes += chunk.len();
-                return Some((chunk, written));
+                return (Some(chunk), chunks_consumed)
             } else {
-                return None;
+                return (None, chunks_consumed)
             }
         }
 
-        // TODO: We might also run here if we consumed only empty chunks. In
-        // this case we however have no way to report the amount of consumed
-        // chunks to the caller.
-        None
+        (None, chunks_consumed)
     }
 }
 
@@ -102,24 +101,21 @@ impl<'a> ByteSlice<'a> {
 }
 
 impl<'a> BytesSource for ByteSlice<'a> {
-    fn pop_chunk(&mut self, limit: usize) -> Option<(Bytes, Written)> {
+    fn pop_chunk(&mut self, limit: usize) -> (Option<Bytes>, usize) {
         let limit = limit.min(self.data.len());
         if limit == 0 {
-            return None;
+            return (None, 0);
         }
 
         let chunk = Bytes::from(self.data[..limit].to_owned());
         self.data = &self.data[chunk.len()..];
         
-        let written = Written {
-            bytes: chunk.len(),
-            chunks: if self.data.len() == 0 {
-                1
-            } else {
-                0
-            },
+        let chunks_consumed = if self.data.len() == 0 {
+            1
+        } else {
+            0
         };
-        Some((chunk, written))
+        (Some(chunk), chunks_consumed)
     }
 }
 
