@@ -66,10 +66,10 @@ impl Send {
         let mut limit = limit.min(budget) as usize;
 
         let mut result = Written::default();
-        while let Some(chunk) = source.pop_chunk(limit) {
-            result.bytes += chunk.len();
-            result.chunks += 1; // This isn't correct, because the buffer might be partial consumed
-            limit -= chunk.len();
+        while let Some((chunk, written)) = source.pop_chunk(limit) {
+            result.bytes += written.bytes;
+            result.chunks += written.chunks;
+            limit -= written.bytes;
             self.pending.write(chunk);
         }
 
