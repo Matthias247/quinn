@@ -61,7 +61,7 @@ where
             on_connected_send,
         );
 
-        tokio::spawn(ConnectionDriver(conn.clone()));
+        tokio::spawn(ConnectionDriver((conn.clone(), None)));
 
         Connecting {
             conn: Some(conn),
@@ -272,7 +272,7 @@ where
 /// packets still in flight from the peer are handled gracefully.
 #[must_use = "connection drivers must be spawned for their connections to function"]
 #[derive(Debug)]
-struct ConnectionDriver<S: proto::crypto::Session>(ConnectionRef<S>);
+struct ConnectionDriver<S: proto::crypto::Session>((ConnectionRef<S>, Option<u16>));
 
 impl<S> Future for ConnectionDriver<S>
 where
@@ -282,9 +282,10 @@ where
 
     #[allow(unused_mut)] // MSRV
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
-        let conn = &mut *self.0.lock("poll");
+        let id = *self.0 .1.get_or_insert_with(|| rand::random());
+        let conn = &mut *self.0 .0.lock("poll");
 
-        let span = info_span!("drive", id = conn.handle.0);
+        let span = info_span!("drive", id = id);
         let _guard = span.enter();
 
         loop {

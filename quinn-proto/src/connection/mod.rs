@@ -571,6 +571,7 @@ where
                     if self.in_flight.bytes + bytes_to_send >= self.path.congestion.window() {
                         space_idx += 1;
                         congestion_blocked = true;
+                        trace!("congestion blocked");
                         // We continue instead of breaking here in order to avoid
                         // blocking loss probes queued for higher spaces.
                         continue;
@@ -586,6 +587,7 @@ where
                         now,
                     ) {
                         self.timers.set(Timer::Pacing, delay);
+                        trace!("pacing blocked");
                         congestion_blocked = true;
                         // Loss probes should be subject to pacing, even though
                         // they are not congestion controlled.
@@ -1053,11 +1055,11 @@ where
                 .map_or(true, |pn| ack.largest > pn)
             {
                 space.largest_acked_packet = Some(ack.largest);
-                if let Some(info) = space.sent_packets.get(&ack.largest) {
+                if let Some(info) = space.sent_packets.get(ack.largest) {
                     // This should always succeed, but a misbehaving peer might ACK a packet we
                     // haven't sent. At worst, that will result in us spuriously reducing the
                     // congestion window.
-                    space.largest_acked_packet_sent = info.time_sent;
+                    space.largest_acked_packet_sent = info.time_sent.expect("Must have been sent");
                 }
                 true
             } else {
@@ -1065,21 +1067,40 @@ where
             }
         };
 
+        trace!("on_ack_received packet {:?}", ack);
+
         // Avoid DoS from unreasonably huge ack ranges by filtering out just the new acks.
         let mut newly_acked = ArrayRangeSet::new();
         for range in ack.iter() {
-            for (&pn, _) in self.spaces[space].sent_packets.range(range) {
+            for (pn, _) in self.spaces[space].sent_packets.range(range) {
                 newly_acked.insert_one(pn);
             }
         }
 
         if newly_acked.is_empty() {
+            trace!("Found no packet");
+            // for pn in ack.iter().flatten() {
+            //     if self.spaces[space].sent_packets.get(pn).is_some() {
+            //         self.spaces[space].sent_packets.debug();
+
+            //         let newly_acked = ack
+            //             .iter()
+            //             .flat_map(|range| {
+            //                 trace!("Searching for range {:?}", range);
+            //                 self.spaces[space].sent_packets.range(range).map(|(n, _)| n)
+            //             })
+            //             .collect::<Vec<_>>();
+
+            //         panic!("Did not expect to find PN {}", pn);
+            //     }
+            // }
+
             return Ok(());
         }
 
         let mut ack_eliciting_acked = false;
         for packet in newly_acked.elts() {
-            if let Some(info) = self.spaces[space].sent_packets.remove(&packet) {
+            if let Some(info) = self.spaces[space].sent_packets.remove(packet) {
                 self.spaces[space].pending_acks.subtract(&info.acks);
                 ack_eliciting_acked |= info.ack_eliciting;
                 self.on_packet_acked(now, space, info);
@@ -1162,9 +1183,12 @@ where
         if info.ack_eliciting && self.path.challenge.is_none() {
             // Only pass ACKs to the congestion controller if we are not validating the current
             // path, so as to ignore any ACKs from older paths still coming in.
-            self.path
-                .congestion
-                .on_ack(now, info.time_sent, info.size.into(), self.app_limited);
+            self.path.congestion.on_ack(
+                now,
+                info.time_sent.expect("Time must be set"),
+                info.size.into(),
+                self.app_limited,
+            );
         }
 
         // Update state for confirmed delivery of frames
@@ -1243,12 +1267,13 @@ where
 
         let space = &mut self.spaces[pn_space];
         space.loss_time = None;
-        for (&packet, info) in space.sent_packets.range(0..largest_acked_packet) {
-            if info.time_sent <= lost_send_time || largest_acked_packet >= packet + packet_threshold
+        for (packet, info) in space.sent_packets.range(0..largest_acked_packet) {
+            if info.time_sent.unwrap() <= lost_send_time
+                || largest_acked_packet >= packet + packet_threshold
             {
                 lost_packets.push(packet);
             } else {
-                let next_loss_time = info.time_sent + loss_delay;
+                let next_loss_time = info.time_sent.unwrap() + loss_delay;
                 space.loss_time = Some(
                     space
                         .loss_time
@@ -1260,11 +1285,16 @@ where
         // OnPacketsLost
         if let Some(largest_lost) = lost_packets.last().cloned() {
             let old_bytes_in_flight = self.in_flight.bytes;
-            let largest_lost_sent = self.spaces[pn_space].sent_packets[&largest_lost].time_sent;
+            let largest_lost_sent = self.spaces[pn_space]
+                .sent_packets
+                .get(largest_lost)
+                .unwrap()
+                .time_sent
+                .expect("Packet was sent");
             self.lost_packets += lost_packets.len() as u64;
             trace!("packets lost: {:?}", lost_packets);
             for packet in &lost_packets {
-                let info = self.spaces[pn_space].sent_packets.remove(&packet).unwrap(); // safe: lost_packets is populated just above
+                let info = self.spaces[pn_space].sent_packets.remove(*packet).unwrap(); // safe: lost_packets is populated just above
                 self.remove_in_flight(pn_space, &info);
                 for frame in info.stream_frames {
                     self.streams.retransmit(frame);
@@ -1646,8 +1676,8 @@ where
         space.time_of_last_ack_eliciting_packet = None;
         space.loss_time = None;
         let sent_packets = mem::take(&mut space.sent_packets);
-        for (_, packet) in sent_packets.into_iter() {
-            self.remove_in_flight(space_id, &packet);
+        for (_, packet) in sent_packets.iter() {
+            self.remove_in_flight(space_id, packet);
         }
         self.set_loss_detection_timer(now)
     }
@@ -1923,7 +1953,7 @@ where
                 self.rem_handshake_cid = rem_cid;
 
                 let space = &mut self.spaces[SpaceId::Initial];
-                if let Some(info) = space.sent_packets.remove(&0) {
+                if let Some(info) = space.sent_packets.remove(0) {
                     space.pending_acks.subtract(&info.acks);
                     self.on_packet_acked(now, SpaceId::Initial, info);
                 };
@@ -1944,10 +1974,10 @@ where
                     });
 
                 // Retransmit all 0-RTT data
-                let zero_rtt = mem::take(&mut self.spaces[SpaceId::Data].sent_packets);
-                for (_, info) in zero_rtt {
-                    self.remove_in_flight(SpaceId::Data, &info);
-                    self.spaces[SpaceId::Data].pending |= info.retransmits;
+                let mut zero_rtt = mem::take(&mut self.spaces[SpaceId::Data].sent_packets);
+                for info in zero_rtt.values_mut() {
+                    self.remove_in_flight(SpaceId::Data, info);
+                    self.spaces[SpaceId::Data].pending |= core::mem::take(&mut info.retransmits);
                 }
                 self.streams.retransmit_all_for_0rtt();
 
@@ -2012,7 +2042,7 @@ where
                             // Discard 0-RTT packets
                             let sent_packets =
                                 mem::take(&mut self.spaces[SpaceId::Data].sent_packets);
-                            for (_, packet) in sent_packets {
+                            for (_, packet) in sent_packets.iter() {
                                 self.remove_in_flight(SpaceId::Data, &packet);
                             }
                         } else {
