@@ -1,12 +1,14 @@
 use std::{
     cmp,
-    collections::{BTreeMap, VecDeque},
+    collections::VecDeque,
+    iter::FusedIterator,
     mem,
-    ops::{Index, IndexMut},
+    ops::{Index, IndexMut, RangeBounds},
     time::Instant,
 };
 
 use fxhash::FxHashSet;
+use tracing::trace;
 
 use super::assembler::Assembler;
 use crate::{
@@ -36,8 +38,7 @@ where
     pub(crate) largest_acked_packet: Option<u64>,
     pub(crate) largest_acked_packet_sent: Instant,
     /// Transmitted but not acked
-    // We use a BTreeMap here so we can efficiently query by range on ACK and for loss detection
-    pub(crate) sent_packets: BTreeMap<u64, SentPacket>,
+    pub(crate) sent_packets: SentPackets,
     /// Number of explicit congestion notification codepoints seen on incoming packets
     pub(crate) ecn_counters: frame::EcnCounts,
     /// Recent ECN counters sent by the peer in ACK frames
@@ -85,7 +86,7 @@ where
             next_packet_number: 0,
             largest_acked_packet: None,
             largest_acked_packet_sent: now,
-            sent_packets: BTreeMap::new(),
+            sent_packets: SentPackets::new(),
             ecn_counters: frame::EcnCounts::ZERO,
             ecn_feedback: frame::EcnCounts::ZERO,
 
@@ -206,11 +207,281 @@ impl<S: crypto::Session> IndexMut<SpaceId> for [PacketSpace<S>; 3] {
     }
 }
 
+const SEGMENT_SIZE: usize = 32;
+
+#[derive(Debug, Default)]
+struct SentPacketSegment {
+    packets: [SentPacket; SEGMENT_SIZE],
+    len: u8,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct SentPackets {
+    start_offset: u64,
+    segments: VecDeque<SentPacketSegment>,
+}
+
+impl SentPackets {
+    pub fn new() -> Self {
+        debug_assert!(SEGMENT_SIZE <= std::u8::MAX as usize);
+        Self::default()
+    }
+
+    pub fn debug(&self) {
+        use std::fmt::Write;
+        println!("start_offset: {}", self.start_offset);
+        for (segment_idx, segment) in self.segments.iter().enumerate() {
+            let start_offset = self.start_offset + (segment_idx * SEGMENT_SIZE) as u64;
+            let mut contained = "[".to_string();
+            let mut first = true;
+
+            for (packet_idx, packet) in segment.packets.iter().enumerate() {
+                if !packet.time_sent.is_some() {
+                    continue;
+                }
+                if !first {
+                    contained.push(',');
+                }
+                first = false;
+                let pn = start_offset + packet_idx as u64;
+                write!(contained, "{}", pn).unwrap();
+            }
+            contained.push(']');
+            println!(
+                "Segment start: {}, Len: {}, Contained: {}",
+                start_offset, segment.len, contained
+            );
+        }
+    }
+
+    pub fn insert(&mut self, packet_number: u64, packet: SentPacket) {
+        debug_assert!(packet.time_sent.is_some());
+        // assert!(self.segments.len() < 100);
+
+        while packet_number < self.start_offset {
+            self.segments.push_front(SentPacketSegment::default());
+            self.start_offset -= SEGMENT_SIZE as u64;
+        }
+
+        let (segment_idx, packet_idx) = self
+            .idx(packet_number)
+            .expect("Can not be smaller than start idx");
+        while segment_idx >= self.segments.len() {
+            self.segments.push_back(SentPacketSegment::default());
+        }
+
+        let segment = &mut self.segments[segment_idx];
+        let slot = &mut segment.packets[packet_idx];
+        if slot.time_sent.is_none() {
+            segment.len += 1;
+        }
+        *slot = packet;
+    }
+
+    fn idx(&self, packet_number: u64) -> Option<(usize, usize)> {
+        if packet_number < self.start_offset {
+            return None;
+        }
+        let offset = (packet_number - self.start_offset) as usize;
+
+        let segment_idx = offset / SEGMENT_SIZE;
+        let packet_idx = offset % SEGMENT_SIZE;
+
+        Some((segment_idx, packet_idx))
+    }
+
+    pub fn remove(&mut self, packet_number: u64) -> Option<SentPacket> {
+        let (segment_idx, packet_idx) = self.idx(packet_number)?;
+
+        if segment_idx >= self.segments.len() {
+            return None;
+        }
+
+        let segment = &mut self.segments[segment_idx];
+        let packet = match segment.packets[packet_idx].time_sent {
+            None => None,
+            Some(_) => Some(std::mem::take(&mut segment.packets[packet_idx])),
+        }?;
+
+        segment.len -= 1;
+        loop {
+            let try_remove_front = match self.segments.len() {
+                0 => false,
+                1 => packet_number == self.start_offset + SEGMENT_SIZE as u64 - 1,
+                _ => true,
+            };
+
+            if try_remove_front && self.segments[0].len == 0 {
+                self.segments.pop_front();
+                self.start_offset += SEGMENT_SIZE as u64;
+            } else {
+                break;
+            }
+        }
+
+        // while self.segments.len() > 1 && self.segments[0].len == 0 {
+        //     self.segments.pop_front();
+        //     self.start_offset += SEGMENT_SIZE as u64;
+        // }
+
+        Some(packet)
+    }
+
+    pub fn get(&mut self, packet_number: u64) -> Option<&SentPacket> {
+        // if packet_number > 10_000 {
+        //     self.debug();
+        // }
+
+        let (segment_idx, packet_idx) = self.idx(packet_number)?;
+
+        if segment_idx >= self.segments.len() {
+            return None;
+        }
+
+        let segment = &self.segments[segment_idx];
+        match segment.packets[packet_idx].time_sent {
+            None => None,
+            Some(_) => Some(&segment.packets[packet_idx]),
+        }
+    }
+
+    pub fn range<R: RangeBounds<u64>>(
+        &self,
+        range: R,
+    ) -> impl Iterator<Item = (u64, &SentPacket)> + '_ {
+        let start_idx = match range.start_bound() {
+            std::ops::Bound::Included(b) => *b,
+            std::ops::Bound::Excluded(b) => b.saturating_add(1),
+            std::ops::Bound::Unbounded => 0,
+        };
+
+        let end_idx = (match range.end_bound() {
+            std::ops::Bound::Included(b) => b.saturating_add(1),
+            std::ops::Bound::Excluded(b) => *b,
+            std::ops::Bound::Unbounded => core::u64::MAX,
+        })
+        .max(start_idx);
+
+        trace!("Start_idx: {}, End_idx: {}", start_idx, end_idx);
+
+        let (segment_idx, packet_idx) = match self.idx(start_idx) {
+            None if start_idx < self.start_offset => (0, 0),
+            None => (self.segments.len(), 0),
+            Some((segment_idx, packet_idx)) => (segment_idx, packet_idx),
+        };
+
+        // self.segments.iter().enumerate().filter(|segment_idx| segment_idx) .flat_map(move |(segment_idx, packet)|{
+        //     packet.packets.iter().enumerate().filter(|(packet_idx,p)|p.time_sent.is_some()).map(move |(packet_idx, packet)|
+        //         (start_offset + (segment_idx * SEGMENT_SIZE + packet_idx) as u64, packet))
+        // })
+
+        RangeIterator {
+            packets: self,
+            segment_idx,
+            packet_idx,
+            start_idx,
+            end_idx,
+        }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (u64, &SentPacket)> + '_ {
+        let start_offset = self.start_offset;
+
+        self.segments
+            .iter()
+            .enumerate()
+            .filter(|(_, segment)| segment.len != 0)
+            .flat_map(move |(segment_idx, segment)| {
+                let segment_start =
+                    start_offset + start_offset + (segment_idx * SEGMENT_SIZE) as u64;
+                segment
+                    .packets
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, p)| p.time_sent.is_some())
+                    .map(move |(packet_idx, packet)| (segment_start + packet_idx as u64, packet))
+            })
+    }
+
+    pub fn values_mut(&mut self) -> impl Iterator<Item = &mut SentPacket> + '_ {
+        self.segments
+            .iter_mut()
+            .flat_map(|segment| segment.packets.iter_mut().filter(|p| p.time_sent.is_some()))
+
+        // ValueIterator {
+        //     packets: self,
+        //     segment_idx: 0,
+        //     packet_idx: 0,
+        // }
+    }
+}
+
+// impl Iterator for SentPackets {
+//     type Item = (u64, SentPacket);
+
+//     fn next(&mut self) -> Option<Self::Item> {
+//         todo!()
+//     }
+// }
+
+struct RangeIterator<'a> {
+    packets: &'a SentPackets,
+    segment_idx: usize,
+    packet_idx: usize,
+    start_idx: u64,
+    end_idx: u64,
+}
+
+impl<'a> Iterator for RangeIterator<'a> {
+    type Item = (u64, &'a SentPacket);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.segment_idx >= self.packets.segments.len() {
+                return None;
+            }
+
+            let segment_start =
+                self.packets.start_offset + (self.segment_idx * SEGMENT_SIZE) as u64;
+            let segment_end = segment_start + SEGMENT_SIZE as u64;
+            if self.start_idx >= segment_end {
+                self.segment_idx += 1;
+                self.packet_idx = 0;
+                // assert!(self.packet_idx == 0);
+                continue;
+            } else if segment_start >= self.end_idx {
+                return None;
+            }
+
+            let packet = &self.packets.segments[self.segment_idx].packets[self.packet_idx];
+            let packet_nr = segment_start + self.packet_idx as u64;
+            self.packet_idx += 1;
+            if self.packet_idx == SEGMENT_SIZE {
+                self.packet_idx = 0;
+                self.segment_idx += 1;
+            }
+
+            if packet_nr < self.start_idx {
+                continue;
+            } else if packet_nr >= self.end_idx {
+                return None;
+            }
+
+            match packet.time_sent {
+                None => continue,
+                Some(_) => return Some((packet_nr, packet)),
+            }
+        }
+    }
+}
+
+impl<'a> FusedIterator for RangeIterator<'a> {}
+
 /// Represents one or more packets subject to retransmission
-#[derive(Debug, Clone)]
+#[derive(Debug, Default, Clone)]
 pub(crate) struct SentPacket {
     /// The time the packet was sent.
-    pub(crate) time_sent: Instant,
+    pub(crate) time_sent: Option<Instant>,
     /// The number of bytes sent in the packet, not including UDP or IP overhead, but including QUIC
     /// framing overhead. Zero if this packet is not counted towards congestion control, i.e. not an
     /// "in flight" packet.
