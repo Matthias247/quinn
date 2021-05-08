@@ -1059,7 +1059,7 @@ where
                     // This should always succeed, but a misbehaving peer might ACK a packet we
                     // haven't sent. At worst, that will result in us spuriously reducing the
                     // congestion window.
-                    space.largest_acked_packet_sent = info.time_sent.expect("Must have been sent");
+                    space.largest_acked_packet_sent = info.time_sent;
                 }
                 true
             } else {
@@ -1185,7 +1185,7 @@ where
             // path, so as to ignore any ACKs from older paths still coming in.
             self.path.congestion.on_ack(
                 now,
-                info.time_sent.expect("Time must be set"),
+                info.time_sent,
                 info.size.into(),
                 self.app_limited,
             );
@@ -1268,12 +1268,12 @@ where
         let space = &mut self.spaces[pn_space];
         space.loss_time = None;
         for (packet, info) in space.sent_packets.range(0..largest_acked_packet) {
-            if info.time_sent.unwrap() <= lost_send_time
+            if info.time_sent <= lost_send_time
                 || largest_acked_packet >= packet + packet_threshold
             {
                 lost_packets.push(packet);
             } else {
-                let next_loss_time = info.time_sent.unwrap() + loss_delay;
+                let next_loss_time = info.time_sent + loss_delay;
                 space.loss_time = Some(
                     space
                         .loss_time
@@ -1289,8 +1289,7 @@ where
                 .sent_packets
                 .get(largest_lost)
                 .unwrap()
-                .time_sent
-                .expect("Packet was sent");
+                .time_sent;
             self.lost_packets += lost_packets.len() as u64;
             trace!("packets lost: {:?}", lost_packets);
             for packet in &lost_packets {
