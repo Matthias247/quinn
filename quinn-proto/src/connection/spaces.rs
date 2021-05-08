@@ -209,10 +209,36 @@ impl<S: crypto::Session> IndexMut<SpaceId> for [PacketSpace<S>; 3] {
 
 const SEGMENT_SIZE: usize = 32;
 
+#[derive(Default, Debug)]
+struct Usage {
+    usage: u32,
+}
+
+impl Usage {
+    fn len(&self) -> usize {
+        self.usage.count_ones() as usize
+    }
+
+    fn is_set(&self, idx: usize) -> bool {
+        debug_assert!(idx < 32);
+        (self.usage >> idx) & 1 != 0
+    }
+
+    fn set(&mut self, idx: usize, is_set: bool) {
+        debug_assert!(idx < 32);
+        let mask = 1 << idx;
+        if is_set {
+            self.usage |= mask;
+        } else {
+            self.usage &= !mask;
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct SentPacketSegment {
-    packets: [SentPacket; SEGMENT_SIZE],
-    len: u8,
+    packets: [Option<SentPacket>; SEGMENT_SIZE],
+    usage: Usage,
 }
 
 #[derive(Debug, Default)]
@@ -236,7 +262,7 @@ impl SentPackets {
             let mut first = true;
 
             for (packet_idx, packet) in segment.packets.iter().enumerate() {
-                if !packet.time_sent.is_some() {
+                if !packet.is_some() {
                     continue;
                 }
                 if !first {
@@ -249,13 +275,14 @@ impl SentPackets {
             contained.push(']');
             println!(
                 "Segment start: {}, Len: {}, Contained: {}",
-                start_offset, segment.len, contained
+                start_offset,
+                segment.usage.len(),
+                contained
             );
         }
     }
 
     pub fn insert(&mut self, packet_number: u64, packet: SentPacket) {
-        debug_assert!(packet.time_sent.is_some());
         // assert!(self.segments.len() < 100);
 
         while packet_number < self.start_offset {
@@ -272,10 +299,8 @@ impl SentPackets {
 
         let segment = &mut self.segments[segment_idx];
         let slot = &mut segment.packets[packet_idx];
-        if slot.time_sent.is_none() {
-            segment.len += 1;
-        }
-        *slot = packet;
+        segment.usage.set(packet_idx, true);
+        *slot = Some(packet);
     }
 
     fn idx(&self, packet_number: u64) -> Option<(usize, usize)> {
@@ -298,12 +323,12 @@ impl SentPackets {
         }
 
         let segment = &mut self.segments[segment_idx];
-        let packet = match segment.packets[packet_idx].time_sent {
+        let packet = match segment.packets[packet_idx] {
             None => None,
             Some(_) => Some(std::mem::take(&mut segment.packets[packet_idx])),
-        }?;
+        }??;
 
-        segment.len -= 1;
+        segment.usage.set(packet_idx, false);
         loop {
             let try_remove_front = match self.segments.len() {
                 0 => false,
@@ -311,7 +336,7 @@ impl SentPackets {
                 _ => true,
             };
 
-            if try_remove_front && self.segments[0].len == 0 {
+            if try_remove_front && self.segments[0].usage.len() == 0 {
                 self.segments.pop_front();
                 self.start_offset += SEGMENT_SIZE as u64;
             } else {
@@ -339,10 +364,7 @@ impl SentPackets {
         }
 
         let segment = &self.segments[segment_idx];
-        match segment.packets[packet_idx].time_sent {
-            None => None,
-            Some(_) => Some(&segment.packets[packet_idx]),
-        }
+        segment.packets[packet_idx].as_ref()
     }
 
     pub fn range<R: RangeBounds<u64>>(
@@ -390,23 +412,26 @@ impl SentPackets {
         self.segments
             .iter()
             .enumerate()
-            .filter(|(_, segment)| segment.len != 0)
+            .filter(|(_, segment)| segment.usage.len() != 0)
             .flat_map(move |(segment_idx, segment)| {
                 let segment_start =
                     start_offset + start_offset + (segment_idx * SEGMENT_SIZE) as u64;
-                segment
-                    .packets
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, p)| p.time_sent.is_some())
-                    .map(move |(packet_idx, packet)| (segment_start + packet_idx as u64, packet))
+
+                (0..SEGMENT_SIZE).filter_map(move |packet_idx| {
+                    if segment.usage.is_set(packet_idx) {
+                        let p = segment.packets[packet_idx].as_ref().unwrap();
+                        Some((segment_start + packet_idx as u64, p))
+                    } else {
+                        None
+                    }
+                })
             })
     }
 
     pub fn values_mut(&mut self) -> impl Iterator<Item = &mut SentPacket> + '_ {
         self.segments
             .iter_mut()
-            .flat_map(|segment| segment.packets.iter_mut().filter(|p| p.time_sent.is_some()))
+            .flat_map(|segment| segment.packets.iter_mut().filter_map(|p| p.as_mut()))
 
         // ValueIterator {
         //     packets: self,
@@ -453,7 +478,8 @@ impl<'a> Iterator for RangeIterator<'a> {
                 return None;
             }
 
-            let packet = &self.packets.segments[self.segment_idx].packets[self.packet_idx];
+            let segment_idx = self.segment_idx;
+            let packet_idx = self.packet_idx;
             let packet_nr = segment_start + self.packet_idx as u64;
             self.packet_idx += 1;
             if self.packet_idx == SEGMENT_SIZE {
@@ -467,10 +493,14 @@ impl<'a> Iterator for RangeIterator<'a> {
                 return None;
             }
 
-            match packet.time_sent {
-                None => continue,
-                Some(_) => return Some((packet_nr, packet)),
+            if !self.packets.segments[segment_idx].usage.is_set(packet_idx) {
+                continue;
             }
+
+            let packet = &self.packets.segments[segment_idx].packets[packet_idx]
+                .as_ref()
+                .unwrap();
+            return Some((packet_nr, packet));
         }
     }
 }
@@ -478,10 +508,10 @@ impl<'a> Iterator for RangeIterator<'a> {
 impl<'a> FusedIterator for RangeIterator<'a> {}
 
 /// Represents one or more packets subject to retransmission
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub(crate) struct SentPacket {
     /// The time the packet was sent.
-    pub(crate) time_sent: Option<Instant>,
+    pub(crate) time_sent: Instant,
     /// The number of bytes sent in the packet, not including UDP or IP overhead, but including QUIC
     /// framing overhead. Zero if this packet is not counted towards congestion control, i.e. not an
     /// "in flight" packet.
