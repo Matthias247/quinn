@@ -180,7 +180,7 @@ impl PacketBuilder {
 
         let packet = SentPacket {
             acks: sent.acks,
-            time_sent: Some(now),
+            time_sent: now,
             size,
             ack_eliciting,
             retransmits: sent.retransmits,
