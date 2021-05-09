@@ -2,7 +2,7 @@ use std::{
     cmp,
     collections::VecDeque,
     iter::FusedIterator,
-    mem,
+    mem::{self, MaybeUninit},
     ops::{Index, IndexMut, RangeBounds},
     time::Instant,
 };
@@ -207,7 +207,7 @@ impl<S: crypto::Session> IndexMut<SpaceId> for [PacketSpace<S>; 3] {
     }
 }
 
-const SEGMENT_SIZE: usize = 32;
+const SEGMENT_SIZE: usize = 31;
 
 #[derive(Default, Debug)]
 struct Usage {
@@ -236,12 +236,6 @@ impl Usage {
 }
 
 #[derive(Debug, Default)]
-struct SentPacketSegment {
-    packets: [Option<SentPacket>; SEGMENT_SIZE],
-    usage: Usage,
-}
-
-#[derive(Debug, Default)]
 pub(crate) struct SentPackets {
     start_offset: u64,
     segments: VecDeque<SentPacketSegment>,
@@ -261,8 +255,8 @@ impl SentPackets {
             let mut contained = "[".to_string();
             let mut first = true;
 
-            for (packet_idx, packet) in segment.packets.iter().enumerate() {
-                if !packet.is_some() {
+            for packet_idx in 0..SEGMENT_SIZE {
+                if !segment.is_set(packet_idx) {
                     continue;
                 }
                 if !first {
@@ -276,15 +270,13 @@ impl SentPackets {
             println!(
                 "Segment start: {}, Len: {}, Contained: {}",
                 start_offset,
-                segment.usage.len(),
+                segment.len(),
                 contained
             );
         }
     }
 
     pub fn insert(&mut self, packet_number: u64, packet: SentPacket) {
-        // assert!(self.segments.len() < 100);
-
         while packet_number < self.start_offset {
             self.segments.push_front(SentPacketSegment::default());
             self.start_offset -= SEGMENT_SIZE as u64;
@@ -298,9 +290,7 @@ impl SentPackets {
         }
 
         let segment = &mut self.segments[segment_idx];
-        let slot = &mut segment.packets[packet_idx];
-        segment.usage.set(packet_idx, true);
-        *slot = Some(packet);
+        segment.insert(packet_idx, packet);
     }
 
     fn idx(&self, packet_number: u64) -> Option<(usize, usize)> {
@@ -323,12 +313,8 @@ impl SentPackets {
         }
 
         let segment = &mut self.segments[segment_idx];
-        let packet = match segment.packets[packet_idx] {
-            None => None,
-            Some(_) => Some(std::mem::take(&mut segment.packets[packet_idx])),
-        }??;
+        let packet = segment.remove(packet_idx)?;
 
-        segment.usage.set(packet_idx, false);
         loop {
             let try_remove_front = match self.segments.len() {
                 0 => false,
@@ -336,7 +322,7 @@ impl SentPackets {
                 _ => true,
             };
 
-            if try_remove_front && self.segments[0].usage.len() == 0 {
+            if try_remove_front && self.segments[0].len() == 0 {
                 self.segments.pop_front();
                 self.start_offset += SEGMENT_SIZE as u64;
             } else {
@@ -344,19 +330,10 @@ impl SentPackets {
             }
         }
 
-        // while self.segments.len() > 1 && self.segments[0].len == 0 {
-        //     self.segments.pop_front();
-        //     self.start_offset += SEGMENT_SIZE as u64;
-        // }
-
         Some(packet)
     }
 
     pub fn get(&mut self, packet_number: u64) -> Option<&SentPacket> {
-        // if packet_number > 10_000 {
-        //     self.debug();
-        // }
-
         let (segment_idx, packet_idx) = self.idx(packet_number)?;
 
         if segment_idx >= self.segments.len() {
@@ -364,7 +341,7 @@ impl SentPackets {
         }
 
         let segment = &self.segments[segment_idx];
-        segment.packets[packet_idx].as_ref()
+        segment.get(packet_idx)
     }
 
     pub fn range<R: RangeBounds<u64>>(
@@ -392,11 +369,6 @@ impl SentPackets {
             Some((segment_idx, packet_idx)) => (segment_idx, packet_idx),
         };
 
-        // self.segments.iter().enumerate().filter(|segment_idx| segment_idx) .flat_map(move |(segment_idx, packet)|{
-        //     packet.packets.iter().enumerate().filter(|(packet_idx,p)|p.time_sent.is_some()).map(move |(packet_idx, packet)|
-        //         (start_offset + (segment_idx * SEGMENT_SIZE + packet_idx) as u64, packet))
-        // })
-
         RangeIterator {
             packets: self,
             segment_idx,
@@ -412,14 +384,14 @@ impl SentPackets {
         self.segments
             .iter()
             .enumerate()
-            .filter(|(_, segment)| segment.usage.len() != 0)
+            .filter(|(_, segment)| segment.len() != 0)
             .flat_map(move |(segment_idx, segment)| {
                 let segment_start =
                     start_offset + start_offset + (segment_idx * SEGMENT_SIZE) as u64;
 
                 (0..SEGMENT_SIZE).filter_map(move |packet_idx| {
-                    if segment.usage.is_set(packet_idx) {
-                        let p = segment.packets[packet_idx].as_ref().unwrap();
+                    if segment.is_set(packet_idx) {
+                        let p = segment.get(packet_idx).unwrap();
                         Some((segment_start + packet_idx as u64, p))
                     } else {
                         None
@@ -431,23 +403,9 @@ impl SentPackets {
     pub fn values_mut(&mut self) -> impl Iterator<Item = &mut SentPacket> + '_ {
         self.segments
             .iter_mut()
-            .flat_map(|segment| segment.packets.iter_mut().filter_map(|p| p.as_mut()))
-
-        // ValueIterator {
-        //     packets: self,
-        //     segment_idx: 0,
-        //     packet_idx: 0,
-        // }
+            .flat_map(|segment| segment.iter_mut())
     }
 }
-
-// impl Iterator for SentPackets {
-//     type Item = (u64, SentPacket);
-
-//     fn next(&mut self) -> Option<Self::Item> {
-//         todo!()
-//     }
-// }
 
 struct RangeIterator<'a> {
     packets: &'a SentPackets,
@@ -493,14 +451,11 @@ impl<'a> Iterator for RangeIterator<'a> {
                 return None;
             }
 
-            if !self.packets.segments[segment_idx].usage.is_set(packet_idx) {
-                continue;
+            let segment = &self.packets.segments[segment_idx];
+            match segment.get(packet_idx) {
+                Some(packet) => return Some((packet_nr, packet)),
+                None => continue,
             }
-
-            let packet = &self.packets.segments[segment_idx].packets[packet_idx]
-                .as_ref()
-                .unwrap();
-            return Some((packet_nr, packet));
         }
     }
 }
@@ -714,6 +669,119 @@ impl Dedup {
     }
 }
 
+#[derive(Debug)]
+struct SentPacketSegment {
+    usage: Usage,
+    _pad: MaybeUninit<[u8; std::mem::size_of::<SentPacket>() - std::mem::size_of::<Usage>()]>,
+    elements: [MaybeUninit<SentPacket>; SEGMENT_SIZE],
+}
+
+impl Default for SentPacketSegment {
+    fn default() -> Self {
+        Self {
+            _pad: MaybeUninit::uninit(),
+            elements: [
+                MaybeUninit::uninit(),
+                MaybeUninit::uninit(),
+                MaybeUninit::uninit(),
+                MaybeUninit::uninit(),
+                MaybeUninit::uninit(),
+                MaybeUninit::uninit(),
+                MaybeUninit::uninit(),
+                MaybeUninit::uninit(),
+                MaybeUninit::uninit(),
+                MaybeUninit::uninit(),
+                MaybeUninit::uninit(),
+                MaybeUninit::uninit(),
+                MaybeUninit::uninit(),
+                MaybeUninit::uninit(),
+                MaybeUninit::uninit(),
+                MaybeUninit::uninit(),
+                MaybeUninit::uninit(),
+                MaybeUninit::uninit(),
+                MaybeUninit::uninit(),
+                MaybeUninit::uninit(),
+                MaybeUninit::uninit(),
+                MaybeUninit::uninit(),
+                MaybeUninit::uninit(),
+                MaybeUninit::uninit(),
+                MaybeUninit::uninit(),
+                MaybeUninit::uninit(),
+                MaybeUninit::uninit(),
+                MaybeUninit::uninit(),
+                MaybeUninit::uninit(),
+                MaybeUninit::uninit(),
+                MaybeUninit::uninit(),
+            ],
+            usage: Usage::default(),
+        }
+    }
+}
+
+impl Drop for SentPacketSegment {
+    fn drop(&mut self) {
+        if self.usage.len() == 0 {
+            return;
+        }
+
+        for idx in 0..SEGMENT_SIZE {
+            let _ = self.remove(idx);
+        }
+    }
+}
+
+impl SentPacketSegment {
+    fn len(&self) -> usize {
+        self.usage.len()
+    }
+
+    fn is_set(&self, idx: usize) -> bool {
+        self.usage.is_set(idx)
+    }
+
+    pub fn get(&self, idx: usize) -> Option<&SentPacket> {
+        if !self.usage.is_set(idx) {
+            return None;
+        }
+
+        let slot = &self.elements[idx];
+        unsafe { Some(&*slot.as_ptr()) }
+    }
+
+    fn insert(&mut self, idx: usize, packet: SentPacket) {
+        let _ = self.remove(idx);
+
+        let slot = &mut self.elements[idx];
+        unsafe {
+            slot.as_mut_ptr().write(packet);
+        }
+        self.usage.set(idx, true);
+    }
+
+    fn remove(&mut self, idx: usize) -> Option<SentPacket> {
+        if !self.usage.is_set(idx) {
+            return None;
+        }
+
+        let slot = &mut self.elements[idx];
+        let packet = unsafe { slot.as_mut_ptr().read() };
+        self.usage.set(idx, false);
+
+        Some(packet)
+    }
+
+    fn iter_mut(&mut self) -> impl Iterator<Item = &mut SentPacket> + '_ {
+        (0..SEGMENT_SIZE).filter_map(move |packet_idx| {
+            if !self.usage.is_set(packet_idx) {
+                return None;
+            }
+
+            let slot = &mut self.elements[packet_idx];
+            unsafe { Some(&mut *slot.as_mut_ptr()) }
+        })
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -779,5 +847,19 @@ mod test {
         // The tracking state of sent packets should be minimal, and not grow
         // over time.
         assert!(std::mem::size_of::<SentPacket>() <= 128);
+    }
+
+    #[test]
+    fn segment_size() {
+        // The tracking state of sent packets should be minimal, and not grow
+        // over time.
+        let segment_size = std::mem::size_of::<SentPacketSegment>();
+        let sent_packet_size = std::mem::size_of::<SentPacket>();
+        assert!(
+            segment_size <= 4096,
+            "Segment size is {}, Packet size is {}",
+            segment_size,
+            sent_packet_size
+        );
     }
 }
