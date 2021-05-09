@@ -209,7 +209,7 @@ impl<S: crypto::Session> IndexMut<SpaceId> for [PacketSpace<S>; 3] {
 
 const SEGMENT_SIZE: usize = 31;
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone, Copy)]
 struct Usage {
     usage: u32,
 }
@@ -363,7 +363,7 @@ impl SentPackets {
 
         trace!("Start_idx: {}, End_idx: {}", start_idx, end_idx);
 
-        let (segment_idx, packet_idx) = match self.idx(start_idx) {
+        let (segment_idx, _packet_idx) = match self.idx(start_idx) {
             None if start_idx < self.start_offset => (0, 0),
             None => (self.segments.len(), 0),
             Some((segment_idx, packet_idx)) => (segment_idx, packet_idx),
@@ -371,8 +371,8 @@ impl SentPackets {
 
         RangeIterator {
             packets: self,
+            segment_iter: None,
             segment_idx,
-            packet_idx,
             start_idx,
             end_idx,
         }
@@ -409,8 +409,8 @@ impl SentPackets {
 
 struct RangeIterator<'a> {
     packets: &'a SentPackets,
+    segment_iter: Option<SentPacketSegmentIter<'a>>,
     segment_idx: usize,
-    packet_idx: usize,
     start_idx: u64,
     end_idx: u64,
 }
@@ -424,37 +424,54 @@ impl<'a> Iterator for RangeIterator<'a> {
                 return None;
             }
 
+            if self.segment_iter.is_none() {
+                self.segment_iter = Some(SentPacketSegmentIter::new(
+                    &self.packets.segments[self.segment_idx],
+                ));
+            }
+
             let segment_start =
                 self.packets.start_offset + (self.segment_idx * SEGMENT_SIZE) as u64;
             let segment_end = segment_start + SEGMENT_SIZE as u64;
             if self.start_idx >= segment_end {
                 self.segment_idx += 1;
-                self.packet_idx = 0;
-                // assert!(self.packet_idx == 0);
+
+                if self.segment_idx >= self.packets.segments.len() {
+                    return None;
+                }
+                self.segment_iter = Some(SentPacketSegmentIter::new(
+                    &self.packets.segments[self.segment_idx],
+                ));
+
                 continue;
             } else if segment_start >= self.end_idx {
                 return None;
             }
 
-            let segment_idx = self.segment_idx;
-            let packet_idx = self.packet_idx;
-            let packet_nr = segment_start + self.packet_idx as u64;
-            self.packet_idx += 1;
-            if self.packet_idx == SEGMENT_SIZE {
-                self.packet_idx = 0;
-                self.segment_idx += 1;
-            }
+            match self.segment_iter.as_mut().unwrap().next() {
+                Some((packet_idx, packet)) => {
+                    let packet_nr = segment_start + packet_idx as u64;
 
-            if packet_nr < self.start_idx {
-                continue;
-            } else if packet_nr >= self.end_idx {
-                return None;
-            }
+                    if packet_nr < self.start_idx {
+                        continue;
+                    } else if packet_nr >= self.end_idx {
+                        return None;
+                    }
 
-            let segment = &self.packets.segments[segment_idx];
-            match segment.get(packet_idx) {
-                Some(packet) => return Some((packet_nr, packet)),
-                None => continue,
+                    return Some((packet_nr, packet));
+                }
+                None => {
+                    // Move on to the next segment
+                    self.segment_idx += 1;
+
+                    if self.segment_idx >= self.packets.segments.len() {
+                        return None;
+                    }
+
+                    self.segment_iter = Some(SentPacketSegmentIter::new(
+                        &self.packets.segments[self.segment_idx],
+                    ));
+                }
             }
         }
     }
@@ -669,6 +686,60 @@ impl Dedup {
     }
 }
 
+struct SentPacketSegmentIter<'a> {
+    segment: &'a SentPacketSegment,
+    usage: u32,
+    idx: usize,
+}
+
+impl<'a> SentPacketSegmentIter<'a> {
+    pub fn new(segment: &'a SentPacketSegment) -> Self {
+        let mut usage = segment.usage.usage;
+        // println!("Usage: {:x}", usage);
+        let mut idx = 0;
+
+        // Find the first written packet
+        let to_skip = usage.trailing_zeros();
+        // println!("Found {} leading zeros", to_skip);
+        usage = usage.wrapping_shr(to_skip);
+        idx += to_skip as usize;
+
+        Self {
+            segment,
+            usage,
+            idx,
+        }
+    }
+}
+
+impl<'a> Iterator for SentPacketSegmentIter<'a> {
+    type Item = (usize, &'a SentPacket);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.idx >= 32 {
+            return None;
+        }
+
+        // println!("Old usage: {:x}", self.usage);
+
+        let p = self
+            .segment
+            .get(self.idx)
+            .map(|p| (self.idx, p))
+            .unwrap_or_else(|| panic!("Assumed index {} is valid", self.idx));
+        self.idx += 1;
+        self.usage = self.usage.wrapping_shr(1);
+
+        let to_skip = self.usage.trailing_zeros();
+        // println!("Found {} leading zeros", to_skip);
+        self.usage = self.usage.wrapping_shr(to_skip);
+        self.idx += to_skip as usize;
+        // println!("New usage: {:x}", self.usage);
+
+        Some(p)
+    }
+}
+
 #[derive(Debug)]
 struct SentPacketSegment {
     usage: Usage,
@@ -736,10 +807,12 @@ impl SentPacketSegment {
     }
 
     fn is_set(&self, idx: usize) -> bool {
+        debug_assert!(idx < SEGMENT_SIZE);
         self.usage.is_set(idx)
     }
 
     pub fn get(&self, idx: usize) -> Option<&SentPacket> {
+        debug_assert!(idx < SEGMENT_SIZE);
         if !self.usage.is_set(idx) {
             return None;
         }
@@ -749,6 +822,7 @@ impl SentPacketSegment {
     }
 
     fn insert(&mut self, idx: usize, packet: SentPacket) {
+        debug_assert!(idx < SEGMENT_SIZE);
         let _ = self.remove(idx);
 
         let slot = &mut self.elements[idx];
@@ -759,6 +833,7 @@ impl SentPacketSegment {
     }
 
     fn remove(&mut self, idx: usize) -> Option<SentPacket> {
+        debug_assert!(idx < SEGMENT_SIZE);
         if !self.usage.is_set(idx) {
             return None;
         }
