@@ -70,7 +70,7 @@ impl<'a> Streams<'a> {
         Some(StreamId::new(!self.state.side, dir, x))
     }
 
-    #[cfg(fuzzing)]
+    // #[cfg(fuzzing)]
     pub fn state(&mut self) -> &mut StreamsState {
         self.state
     }

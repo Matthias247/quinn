@@ -213,7 +213,7 @@ where
     /// State of the unreliable datagram extension
     datagrams: DatagramState,
     /// Connection level statistics
-    stats: ConnectionStats,
+    pub stats: ConnectionStats,
     /// QUIC version used for the connection.
     version: u32,
 }
@@ -1158,6 +1158,10 @@ where
     // Not timing-aware, so it's safe to call this for inferred acks, such as arise from
     // high-latency handshakes
     fn on_packet_acked(&mut self, now: Instant, space: SpaceId, info: SentPacket) {
+        self.stats.path.acks += 1;
+        if self.app_limited {
+            self.stats.path.app_limited += 1;
+        }
         self.remove_in_flight(space, &info);
         if info.ack_eliciting && self.path.challenge.is_none() {
             // Only pass ACKs to the congestion controller if we are not validating the current

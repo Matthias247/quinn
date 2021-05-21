@@ -11,6 +11,7 @@ anyhow = "1.0.22"
 bytes = "1"
 futures = "0.3.8"
 hdrhistogram = { version = "7.2", default-features = false }
+mimalloc = "*"
 quinn = { path = "../quinn" }
 rcgen = "0.8"
 rustls = "0.19"

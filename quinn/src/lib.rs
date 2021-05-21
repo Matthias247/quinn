@@ -159,4 +159,4 @@ enum EndpointEvent {
 ///
 /// This helps ensure we don't starve anything when the CPU is slower than the link.
 /// Value is selected by picking a low number which didn't degrade throughput in benchmarks.
-const IO_LOOP_BOUND: usize = 160;
+const IO_LOOP_BOUND: usize = 200;

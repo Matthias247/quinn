@@ -95,6 +95,8 @@ where
             return Poll::Ready(Err(WriteError::ConnectionClosed(x.clone())));
         }
 
+        // let could_send = conn.inner.streams().state().can_send();
+
         let result = match write_fn(&mut conn.inner.send_stream(self.stream)) {
             Ok(result) => result,
             Err(Blocked) => {
@@ -109,7 +111,9 @@ where
             }
         };
 
-        conn.wake();
+        // if !could_send {
+            conn.wake();
+        // }
         Poll::Ready(Ok(result))
     }
 

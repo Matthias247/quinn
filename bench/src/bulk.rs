@@ -1,3 +1,8 @@
+use mimalloc::MiMalloc;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
 use std::{
     net::{IpAddr, Ipv6Addr, SocketAddr},
     str::FromStr,

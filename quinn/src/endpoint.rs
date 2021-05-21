@@ -1,3 +1,4 @@
+use core::num;
 use std::{
     collections::VecDeque,
     future::Future,
@@ -208,7 +209,7 @@ where
         let now = Instant::now();
         let mut keep_going = false;
         keep_going |= endpoint.drive_recv(cx, now)?;
-        endpoint.handle_events(cx);
+        keep_going |= endpoint.handle_events(cx);
         keep_going |= endpoint.drive_send(cx)?;
 
         if !endpoint.incoming.is_empty() {
@@ -368,8 +369,9 @@ where
         }
     }
 
-    fn handle_events(&mut self, cx: &mut Context) {
+    fn handle_events(&mut self, cx: &mut Context) -> bool {
         use EndpointEvent::*;
+        let mut num_events = 0;
         loop {
             match self.events.poll_next_unpin(cx) {
                 Poll::Ready(Some((ch, event))) => match event {
@@ -394,8 +396,13 @@ where
                 },
                 Poll::Ready(None) => unreachable!("EndpointInner owns one sender"),
                 Poll::Pending => {
-                    return;
+                    return false;
                 }
+            }
+
+            num_events += 1;
+            if num_events >= IO_LOOP_BOUND {
+                return true;
             }
         }
     }

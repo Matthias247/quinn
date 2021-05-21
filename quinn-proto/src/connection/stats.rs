@@ -126,6 +126,10 @@ pub struct PathStats {
     pub cwnd: u64,
     /// Congestion events on the connection
     pub congestion_events: u64,
+
+    pub acks: u64,
+    pub app_limited: u64,
+    pub conn_polls: u64,
 }
 
 /// Connection statistics

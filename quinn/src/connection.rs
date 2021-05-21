@@ -287,21 +287,27 @@ where
         let span = info_span!("drive", id = conn.handle.0);
         let _guard = span.enter();
 
-        loop {
+        conn.inner.stats.path.conn_polls += 1;
+
+        // loop {
             let mut keep_going = false;
             if let Err(e) = conn.process_conn_events(cx) {
                 conn.terminate(e);
                 return Poll::Ready(());
             }
-            conn.drive_transmit();
+            keep_going |= conn.drive_transmit();
             // If a timer expires, there might be more to transmit. When we transmit something, we
             // might need to reset a timer. Hence, we must loop until neither happens.
             keep_going |= conn.drive_timer(cx);
             conn.forward_endpoint_events();
             conn.forward_app_events();
-            if !keep_going || conn.inner.is_drained() {
-                break;
-            }
+        //     if !keep_going || conn.inner.is_drained() {
+        //         break;
+        //     }
+        // }
+
+        if keep_going {
+            cx.waker().wake_by_ref();
         }
 
         if !conn.inner.is_drained() {
@@ -799,17 +805,29 @@ impl<S> ConnectionInner<S>
 where
     S: proto::crypto::Session,
 {
-    fn drive_transmit(&mut self) {
+    fn drive_transmit(&mut self) -> bool {
+        const MAX_TRANSMITS: usize = 10;
         let now = Instant::now();
+        let mut n = 0;
 
         let max_datagrams = caps().max_gso_segments;
 
         while let Some(t) = self.inner.poll_transmit(now, max_datagrams) {
             // If the endpoint driver is gone, noop.
+            n += match t.segment_size {
+                None => 1,
+                Some(s) => t.contents.len() / s,
+            };
             let _ = self
                 .endpoint_events
                 .unbounded_send((self.handle, EndpointEvent::Transmit(t)));
+            
+            if n >= MAX_TRANSMITS {
+                return true;
+            }
         }
+
+        false
     }
 
     fn forward_endpoint_events(&mut self) {
