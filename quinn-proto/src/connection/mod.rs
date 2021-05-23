@@ -1075,12 +1075,16 @@ where
         trace!("on_ack_received packet {:?}", ack);
 
         // Avoid DoS from unreasonably huge ack ranges by filtering out just the new acks.
+        let start_filter = Instant::now();
         let mut newly_acked = ArrayRangeSet::new();
         for range in ack.iter() {
             for (pn, _) in self.spaces[space].sent_packets.range(range) {
                 newly_acked.insert_one(pn);
             }
         }
+        self.stats
+            .filter_new_acks_time
+            .record(start_filter.elapsed());
 
         if newly_acked.is_empty() {
             trace!("Found no packet");
@@ -1100,10 +1104,11 @@ where
             //     }
             // }
 
-            self.stats.ack_time.record(start.elapsed());
+            self.stats.on_ack_received_time.record(start.elapsed());
             return Ok(());
         }
 
+        let start_process = Instant::now();
         let mut ack_eliciting_acked = false;
         for packet in newly_acked.elts() {
             if let Some(info) = self.spaces[space].sent_packets.remove(packet) {
@@ -1112,6 +1117,9 @@ where
                 self.on_packet_acked(now, space, info);
             }
         }
+        self.stats
+            .process_new_acks_time
+            .record(start_process.elapsed());
 
         if new_largest && ack_eliciting_acked {
             let ack_delay = if space != SpaceId::Data {
@@ -1152,7 +1160,7 @@ where
         }
 
         self.set_loss_detection_timer(now);
-        self.stats.ack_time.record(start.elapsed());
+        self.stats.on_ack_received_time.record(start.elapsed());
         Ok(())
     }
 
