@@ -1132,6 +1132,7 @@ where
                 )
             };
             let rtt = instant_saturating_sub(now, self.spaces[space].largest_acked_packet_sent);
+            self.stats.duration_update.record(rtt);
             self.path.rtt.update(ack_delay, rtt);
         }
 

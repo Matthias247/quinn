@@ -155,6 +155,8 @@ pub struct ConnectionStats {
     ///
     pub insert_time: AvgTime,
     ///
+    pub duration_update: AvgTime,
+    ///
     pub ack_only: u64,
 }
 
