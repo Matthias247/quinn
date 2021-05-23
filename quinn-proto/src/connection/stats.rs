@@ -1,7 +1,7 @@
 //! Connection statistics
 
 use crate::{frame::Frame, Dir};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Statistics about UDP datagrams transmitted or received on a connection
 #[derive(Default, Debug, Copy, Clone)]
@@ -142,4 +142,41 @@ pub struct ConnectionStats {
     pub frame_rx: FrameStats,
     /// Statistics related to the current transmission path
     pub path: PathStats,
+    ///
+    pub ack_time: AvgTime,
+    ///
+    pub transmit_time: AvgTime,
+}
+
+#[derive(Default, Debug, Clone, Copy)]
+pub struct AvgTime {
+    pub total: Duration,
+    pub calls: usize,
+    pub avg: Duration,
+}
+
+impl AvgTime {
+    pub fn record(&mut self, duration: Duration) {
+        self.total += duration;
+        self.calls += 1;
+        self.avg = self.total / self.calls as u32;
+    }
+
+    pub fn guard(&mut self) -> AvgTimeGuard {
+        AvgTimeGuard {
+            time: self,
+            start: Instant::now(),
+        }
+    }
+}
+
+pub struct AvgTimeGuard<'a> {
+    time: &'a mut AvgTime,
+    start: Instant,
+}
+
+impl<'a> Drop for AvgTimeGuard<'a> {
+    fn drop(&mut self) {
+        self.time.record(self.start.elapsed())
+    }
 }

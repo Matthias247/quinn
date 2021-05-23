@@ -1045,6 +1045,7 @@ where
         space: SpaceId,
         ack: frame::Ack,
     ) -> Result<(), TransportError> {
+        let start = Instant::now();
         if ack.largest >= self.spaces[space].next_packet_number {
             return Err(TransportError::PROTOCOL_VIOLATION("unsent packet acked"));
         }
@@ -1095,6 +1096,7 @@ where
             //     }
             // }
 
+            self.stats.ack_time.record(start.elapsed());
             return Ok(());
         }
 
@@ -1146,6 +1148,7 @@ where
         }
 
         self.set_loss_detection_timer(now);
+        self.stats.ack_time.record(start.elapsed());
         Ok(())
     }
 
