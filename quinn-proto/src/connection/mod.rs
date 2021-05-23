@@ -1071,6 +1071,7 @@ where
                 false
             }
         };
+        self.stats.get_largest_time.record(start.elapsed());
 
         trace!("on_ack_received packet {:?}", ack);
 
