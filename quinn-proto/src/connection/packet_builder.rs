@@ -188,7 +188,9 @@ impl PacketBuilder {
         };
 
         conn.in_flight.insert(&packet);
+        let start = Instant::now();
         conn.spaces[space_id].sent(exact_number, packet);
+        conn.stats.insert_time.record(start.elapsed());
         conn.reset_keep_alive(now);
         if size != 0 {
             if ack_eliciting {

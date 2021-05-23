@@ -146,6 +146,8 @@ pub struct ConnectionStats {
     pub ack_time: AvgTime,
     ///
     pub transmit_time: AvgTime,
+    ///
+    pub insert_time: AvgTime,
 }
 
 #[derive(Default, Debug, Clone, Copy)]
