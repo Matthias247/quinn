@@ -148,6 +148,8 @@ pub struct ConnectionStats {
     pub transmit_time: AvgTime,
     ///
     pub insert_time: AvgTime,
+    ///
+    pub ack_only: u64,
 }
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -155,10 +157,18 @@ pub struct AvgTime {
     pub total: Duration,
     pub calls: usize,
     pub avg: Duration,
+    pub min: Duration,
+    pub max: Duration,
 }
 
 impl AvgTime {
     pub fn record(&mut self, duration: Duration) {
+        if self.min.as_nanos() == 0 {
+            self.min = duration;
+        } else {
+            self.min = self.min.min(duration);
+        }
+        self.max = self.max.max(duration);
         self.total += duration;
         self.calls += 1;
         self.avg = self.total / self.calls as u32;

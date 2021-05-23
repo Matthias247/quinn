@@ -178,6 +178,10 @@ impl PacketBuilder {
             false => 0,
         };
 
+        if !sent.acks.is_empty() && sent.retransmits.is_empty() && sent.stream_frames.is_empty() {
+            conn.stats.ack_only += 1;
+        }
+
         let packet = SentPacket {
             acks: sent.acks,
             time_sent: now,
