@@ -409,6 +409,7 @@ where
     /// single Transmit using GSO. This must be at least 1.
     #[must_use]
     pub fn poll_transmit(&mut self, now: Instant, max_datagrams: usize) -> Option<Transmit> {
+        let start = Instant::now();
         assert!(max_datagrams != 0);
         let max_datagrams = max_datagrams.min(MAX_TRANSMIT_SEGMENTS);
 
@@ -455,6 +456,7 @@ where
                 self.stats.udp_tx.datagrams += 1;
                 self.stats.udp_tx.transmits += 1;
                 self.stats.udp_tx.bytes += buf.len() as u64;
+                self.stats.transmit_time.record(start.elapsed());
                 return Some(Transmit {
                     destination,
                     contents: buf,
@@ -474,6 +476,7 @@ where
         let close = match self.state {
             State::Drained => {
                 self.app_limited = true;
+                self.stats.transmit_time.record(start.elapsed());
                 return None;
             }
             State::Draining | State::Closed(_) => {
@@ -481,6 +484,7 @@ where
                 // encoded successfully
                 if !self.close {
                     self.app_limited = true;
+                    self.stats.transmit_time.record(start.elapsed());
                     return None;
                 }
                 true
@@ -731,7 +735,7 @@ where
         }
 
         self.app_limited = buf.is_empty() && !congestion_blocked;
-
+        self.stats.transmit_time.record(start.elapsed());
         if buf.is_empty() {
             return None;
         }
