@@ -1267,7 +1267,7 @@ where
 
         let space = &mut self.spaces[pn_space];
         space.loss_time = None;
-        for (packet, info) in space.sent_packets.range(0..largest_acked_packet) {
+        for (packet, info) in space.sent_packets.range(0..=largest_acked_packet) {
             if info.time_sent <= lost_send_time
                 || largest_acked_packet >= packet + packet_threshold
             {

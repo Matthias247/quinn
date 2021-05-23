@@ -3,12 +3,11 @@ use std::{
     collections::VecDeque,
     iter::FusedIterator,
     mem::{self, MaybeUninit},
-    ops::{Index, IndexMut, RangeBounds},
+    ops::{Index, IndexMut, RangeBounds, RangeInclusive},
     time::Instant,
 };
 
 use fxhash::FxHashSet;
-use tracing::trace;
 
 use super::assembler::Assembler;
 use crate::{
@@ -221,7 +220,8 @@ impl Usage {
 
     fn is_set(&self, idx: usize) -> bool {
         debug_assert!(idx < 32);
-        (self.usage >> idx) & 1 != 0
+        let mask = 1 << idx;
+        self.usage & mask != 0
     }
 
     fn set(&mut self, idx: usize, is_set: bool) {
@@ -344,38 +344,11 @@ impl SentPackets {
         segment.get(packet_idx)
     }
 
-    pub fn range<R: RangeBounds<u64>>(
+    pub fn range(
         &self,
-        range: R,
+        range: RangeInclusive<u64>,
     ) -> impl Iterator<Item = (u64, &SentPacket)> + '_ {
-        let start_idx = match range.start_bound() {
-            std::ops::Bound::Included(b) => *b,
-            std::ops::Bound::Excluded(b) => b.saturating_add(1),
-            std::ops::Bound::Unbounded => 0,
-        };
-
-        let end_idx = (match range.end_bound() {
-            std::ops::Bound::Included(b) => b.saturating_add(1),
-            std::ops::Bound::Excluded(b) => *b,
-            std::ops::Bound::Unbounded => core::u64::MAX,
-        })
-        .max(start_idx);
-
-        trace!("Start_idx: {}, End_idx: {}", start_idx, end_idx);
-
-        let (segment_idx, _packet_idx) = match self.idx(start_idx) {
-            None if start_idx < self.start_offset => (0, 0),
-            None => (self.segments.len(), 0),
-            Some((segment_idx, packet_idx)) => (segment_idx, packet_idx),
-        };
-
-        RangeIterator {
-            packets: self,
-            segment_iter: None,
-            segment_idx,
-            start_idx,
-            end_idx,
-        }
+        RangeIterator::new(self, range)
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (u64, &SentPacket)> + '_ {
@@ -415,36 +388,56 @@ struct RangeIterator<'a> {
     end_idx: u64,
 }
 
+impl<'a> RangeIterator<'a> {
+    pub fn new(packets: &'a SentPackets, range: RangeInclusive<u64>) -> Self {
+        let start_idx = *range.start();
+        let end_idx = *range.end();
+
+        // trace!("Start_idx: {}, End_idx: {}", start_idx, end_idx);
+
+        let (segment_idx, packet_idx) = match packets.idx(start_idx) {
+            None if start_idx < packets.start_offset => (0, 0),
+            None => (packets.segments.len(), 0),
+            Some((segment_idx, packet_idx)) => (segment_idx, packet_idx),
+        };
+
+        let segment_iter = if segment_idx >= packets.segments.len() {
+            None
+        } else {
+            Some(SentPacketSegmentIter::new(
+                &packets.segments[segment_idx],
+                packet_idx,
+            ))
+        };
+
+        Self {
+            packets,
+            segment_iter,
+            segment_idx,
+            start_idx,
+            end_idx,
+        }
+    }
+}
+
 impl<'a> Iterator for RangeIterator<'a> {
     type Item = (u64, &'a SentPacket);
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            if self.segment_idx >= self.packets.segments.len() {
-                return None;
-            }
-
             if self.segment_iter.is_none() {
-                self.segment_iter = Some(SentPacketSegmentIter::new(
-                    &self.packets.segments[self.segment_idx],
-                ));
+                return None;
             }
 
             let segment_start =
                 self.packets.start_offset + (self.segment_idx * SEGMENT_SIZE) as u64;
             let segment_end = segment_start + SEGMENT_SIZE as u64;
-            if self.start_idx >= segment_end {
-                self.segment_idx += 1;
 
-                if self.segment_idx >= self.packets.segments.len() {
-                    return None;
-                }
-                self.segment_iter = Some(SentPacketSegmentIter::new(
-                    &self.packets.segments[self.segment_idx],
-                ));
-
-                continue;
-            } else if segment_start >= self.end_idx {
+            debug_assert!(
+                self.start_idx < segment_end,
+                "Non-interesting segments should be skipped"
+            );
+            if segment_start > self.end_idx {
                 return None;
             }
 
@@ -453,8 +446,9 @@ impl<'a> Iterator for RangeIterator<'a> {
                     let packet_nr = segment_start + packet_idx as u64;
 
                     if packet_nr < self.start_idx {
+                        panic!("Should not happen");
                         continue;
-                    } else if packet_nr >= self.end_idx {
+                    } else if packet_nr > self.end_idx {
                         return None;
                     }
 
@@ -463,13 +457,14 @@ impl<'a> Iterator for RangeIterator<'a> {
                 None => {
                     // Move on to the next segment
                     self.segment_idx += 1;
+                    self.segment_iter = None;
 
                     if self.segment_idx >= self.packets.segments.len() {
                         return None;
                     }
-
                     self.segment_iter = Some(SentPacketSegmentIter::new(
                         &self.packets.segments[self.segment_idx],
+                        0,
                     ));
                 }
             }
@@ -693,10 +688,13 @@ struct SentPacketSegmentIter<'a> {
 }
 
 impl<'a> SentPacketSegmentIter<'a> {
-    pub fn new(segment: &'a SentPacketSegment) -> Self {
+    pub fn new(segment: &'a SentPacketSegment, skip: usize) -> Self {
         let mut usage = segment.usage.usage;
         // println!("Usage: {:x}", usage);
         let mut idx = 0;
+
+        idx += skip;
+        usage = usage.wrapping_shr(skip as u32);
 
         // Find the first written packet
         let to_skip = usage.trailing_zeros();
@@ -727,9 +725,8 @@ impl<'a> Iterator for SentPacketSegmentIter<'a> {
             .get(self.idx)
             .map(|p| (self.idx, p))
             .unwrap_or_else(|| panic!("Assumed index {} is valid", self.idx));
-        self.idx += 1;
-        self.usage = self.usage.wrapping_shr(1);
 
+        self.usage &= 0xFFFF_FFFE;
         let to_skip = self.usage.trailing_zeros();
         // println!("Found {} leading zeros", to_skip);
         self.usage = self.usage.wrapping_shr(to_skip);
