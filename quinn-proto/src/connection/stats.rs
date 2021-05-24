@@ -143,6 +143,8 @@ pub struct ConnectionStats {
     /// Statistics related to the current transmission path
     pub path: PathStats,
     ///
+    pub conn_poll: AvgTime,
+    ///
     pub on_ack_received_time: AvgTime,
     ///
     pub get_largest_time: AvgTime,

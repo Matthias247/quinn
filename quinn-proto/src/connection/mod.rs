@@ -213,7 +213,7 @@ where
     /// State of the unreliable datagram extension
     datagrams: DatagramState,
     /// Connection level statistics
-    stats: ConnectionStats,
+    pub stats: ConnectionStats,
     /// QUIC version used for the connection.
     version: u32,
 }

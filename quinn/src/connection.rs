@@ -288,6 +288,8 @@ where
         let span = info_span!("drive", id = id);
         let _guard = span.enter();
 
+        let start = Instant::now();
+
         if let Err(e) = conn.process_conn_events(cx) {
             conn.terminate(e);
             return Poll::Ready(());
@@ -306,6 +308,7 @@ where
             } else {
                 conn.driver = Some(cx.waker().clone());
             }
+            conn.inner.stats.conn_poll.record(start.elapsed());
             return Poll::Pending;
         }
         if conn.error.is_none() {
