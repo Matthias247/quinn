@@ -1078,11 +1078,14 @@ where
         // Avoid DoS from unreasonably huge ack ranges by filtering out just the new acks.
         let start_filter = Instant::now();
         let mut newly_acked = ArrayRangeSet::new();
+        let mut num_ranges = 0;
         for range in ack.iter() {
             for (pn, _) in self.spaces[space].sent_packets.range(range) {
                 newly_acked.insert_one(pn);
             }
+            num_ranges += 1;
         }
+        self.stats.ack_ranges.record(num_ranges);
         self.stats
             .filter_new_acks_time
             .record(start_filter.elapsed());

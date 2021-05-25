@@ -160,6 +160,8 @@ pub struct ConnectionStats {
     pub duration_update: AvgTime,
     ///
     pub ack_only: u64,
+    ///
+    pub ack_ranges: AvgU64,
 }
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -200,5 +202,36 @@ pub struct AvgTimeGuard<'a> {
 impl<'a> Drop for AvgTimeGuard<'a> {
     fn drop(&mut self) {
         self.time.record(self.start.elapsed())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct AvgU64 {
+    pub total: u64,
+    pub calls: usize,
+    pub avg: f64,
+    pub min: u64,
+    pub max: u64,
+}
+
+impl Default for AvgU64 {
+    fn default() -> Self {
+        Self {
+            total: 0,
+            calls: 0,
+            avg: 0.0,
+            min: u64::MAX,
+            max: 0,
+        }
+    }
+}
+
+impl AvgU64 {
+    pub fn record(&mut self, value: u64) {
+        self.min = self.min.min(value);
+        self.max = self.max.max(value);
+        self.total += value;
+        self.calls += 1;
+        self.avg = self.total as f64 / self.calls as f64;
     }
 }
