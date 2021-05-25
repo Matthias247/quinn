@@ -1080,12 +1080,12 @@ where
         let mut newly_acked = ArrayRangeSet::new();
         let mut num_ranges = 0;
         for range in ack.iter() {
-            for (pn, _) in self.spaces[space].sent_packets.range(range) {
+            for (pn, _) in self.spaces[space].sent_packets.range(range.clone()) {
                 newly_acked.insert_one(pn);
             }
             num_ranges += 1;
+            self.stats.ack_ranges.record(range.count() as _);
         }
-        self.stats.ack_ranges.record(num_ranges);
         self.stats
             .filter_new_acks_time
             .record(start_filter.elapsed());
