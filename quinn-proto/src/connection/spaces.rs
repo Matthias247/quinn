@@ -26,9 +26,7 @@ where
     /// Data to send
     pub(crate) pending: Retransmits,
     /// Packet numbers to acknowledge
-    pub(crate) pending_acks: ArrayRangeSet,
-    /// Set iff we have received a non-ack frame since the last ack-only packet we sent
-    pub(crate) permit_ack_only: bool,
+    pub(crate) pending_acks: PendingAcks,
 
     /// The packet number of the next packet that will be sent, if any.
     pub(crate) next_packet_number: u64,
@@ -79,8 +77,7 @@ where
             rx_packet: 0,
 
             pending: Retransmits::default(),
-            pending_acks: ArrayRangeSet::new(),
-            permit_ack_only: false,
+            pending_acks: PendingAcks::default(),
 
             next_packet_number: 0,
             largest_acked_packet: None,
@@ -149,9 +146,7 @@ where
     }
 
     pub(crate) fn can_send(&self) -> bool {
-        !self.pending.is_empty()
-            || (self.permit_ack_only && !self.pending_acks.is_empty())
-            || self.ping_pending
+        !self.pending.is_empty() || self.pending_acks.can_send() || self.ping_pending
     }
 
     /// Verifies sanity of an ECN block and returns whether congestion was encountered.
@@ -412,6 +407,69 @@ impl Dedup {
         }
     }
 }
+
+#[derive(Debug)]
+pub(crate) struct PendingAcks {
+    permit_ack_only: bool,
+    pending_acks: ArrayRangeSet,
+}
+
+impl Default for PendingAcks {
+    fn default() -> Self {
+        Self {
+            permit_ack_only: false,
+            pending_acks: ArrayRangeSet::new(),
+        }
+    }
+}
+
+impl PendingAcks {
+    /// Whether any ACK frames can be sent
+    pub fn can_send(&self) -> bool {
+        self.permit_ack_only && !self.pending_acks.is_empty()
+    }
+
+    /// Should be called whenever an ACK eliciting frame was received
+    ///
+    /// This requires sending new outgoing ACKs
+    pub fn ack_eliciting_frame_received(&mut self) {
+        self.permit_ack_only = true;
+    }
+
+    /// Should be called whenever ACKs have been sent
+    ///
+    /// This will suppress sending further ACKs until additional ACK eliciting frames arrive
+    pub fn acks_sent(&mut self) {
+        // If we sent any acks, don't immediately resend them. Setting this even if ack_only is
+        // false needlessly prevents us from ACKing the next packet if it's ACK-only, but saves
+        // the need for subtler logic to avoid double-transmitting acks all the time.
+        // This reset needs to happen before we check whether more data
+        // is available in this space - because otherwise it would return
+        // `true` purely due to the ACKs
+        self.permit_ack_only = false;
+    }
+
+    /// Insert one packet that needs to be acknowledged
+    pub fn insert_one(&mut self, packet: u64) {
+        self.pending_acks.insert_one(packet);
+        if self.pending_acks.len() > MAX_ACK_BLOCKS {
+            self.pending_acks.pop_min();
+        }
+    }
+
+    /// Removes the given ACKs from the set of pending ACKs
+    pub fn subtract(&mut self, acks: &ArrayRangeSet) {
+        self.pending_acks.subtract(acks);
+    }
+
+    /// Returns the set of currently pending ACK ranges
+    pub fn ranges(&self) -> &ArrayRangeSet {
+        &self.pending_acks
+    }
+}
+
+/// Ensures we can always fit all our ACKs in a single minimum-MTU packet with room to spare
+const MAX_ACK_BLOCKS: usize = 64;
 
 #[cfg(test)]
 mod test {
