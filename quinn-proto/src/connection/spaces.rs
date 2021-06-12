@@ -5,6 +5,7 @@ use std::{
     ops::{Index, IndexMut},
     time::Instant,
 };
+use tracing::trace;
 
 use fxhash::FxHashSet;
 
@@ -115,9 +116,17 @@ where
             return;
         }
 
+        trace!("Queuing loss probe");
+
+        // Allow ACKs to be sent without delay
+        // if self.pending_acks.ack_timer().is_some() {
+            // self.pending_acks.ack_timer_expired();
+        // }
+
         // Retransmit the data of the oldest in-flight packet
         if !self.pending.is_empty() {
             // There's real data to send here, no need to make something up
+            trace!("Real data exists");
             return;
         }
 
@@ -125,6 +134,7 @@ where
             if !packet.retransmits.is_empty() {
                 // Remove retransmitted data from the old packet so we don't end up retransmitting
                 // it *again* even if the copy we're sending now gets acknowledged.
+                trace!("Queuing {:?} as probe", packet.retransmits);
                 self.pending |= mem::take(&mut packet.retransmits);
                 return;
             }
@@ -133,6 +143,7 @@ where
         // Nothing new to send and nothing to retransmit, so fall back on a ping. This should only
         // happen in rare cases during the handshake when the server becomes blocked by
         // anti-amplification.
+        trace!("Queuing a ping");
         self.ping_pending = true;
     }
 
@@ -233,7 +244,7 @@ pub struct Retransmits {
     pub(crate) stop_sending: Vec<frame::StopSending>,
     pub(crate) max_stream_data: FxHashSet<StreamId>,
     pub(crate) crypto: VecDeque<frame::Crypto>,
-    pub(crate) new_cids: Vec<IssuedCid>,
+    pub(crate) new_cids: VecDeque<IssuedCid>,
     pub(crate) retire_cids: Vec<u64>,
     pub(crate) handshake_done: bool,
 }
@@ -263,7 +274,7 @@ impl Default for Retransmits {
             stop_sending: Vec::new(),
             max_stream_data: FxHashSet::default(),
             crypto: VecDeque::new(),
-            new_cids: Vec::new(),
+            new_cids: VecDeque::new(),
             retire_cids: Vec::new(),
             handshake_done: false,
         }
@@ -283,7 +294,13 @@ impl ::std::ops::BitOrAssign for Retransmits {
         for crypto in rhs.crypto.into_iter().rev() {
             self.crypto.push_front(crypto);
         }
-        self.new_cids.extend(&rhs.new_cids);
+        for new_cid in rhs.new_cids.into_iter().rev() {
+            self.new_cids.push_front(new_cid);
+        }
+        // self.new_cids.extend(&rhs.new_cids);
+        if !rhs.retire_cids.is_empty() {
+            trace!("extending retire_cids by {:?}", rhs.retire_cids);
+        }
         self.retire_cids.extend(rhs.retire_cids);
         self.handshake_done |= rhs.handshake_done;
     }
@@ -412,6 +429,9 @@ impl Dedup {
 pub(crate) struct PendingAcks {
     permit_ack_only: bool,
     pending_acks: ArrayRangeSet,
+    acks_since_last_sent: u8,
+    force_ack_at: Option<Instant>,
+    latest_ack: Option<Instant>,
 }
 
 impl Default for PendingAcks {
@@ -419,6 +439,9 @@ impl Default for PendingAcks {
         Self {
             permit_ack_only: false,
             pending_acks: ArrayRangeSet::new(),
+            acks_since_last_sent: 0,
+            force_ack_at: None,
+            latest_ack: None,
         }
     }
 }
@@ -429,11 +452,37 @@ impl PendingAcks {
         self.permit_ack_only && !self.pending_acks.is_empty()
     }
 
+    pub fn ack_timer(&self) -> Option<Instant> {
+        self.force_ack_at
+    }
+
+    pub fn latest_ack(&self) -> Option<Instant> {
+        self.latest_ack
+    }
+
+    pub fn ack_timer_expired(&mut self) {
+        self.permit_ack_only = true;
+        self.force_ack_at = None;
+    }
+
     /// Should be called whenever an ACK eliciting frame was received
     ///
     /// This requires sending new outgoing ACKs
-    pub fn ack_eliciting_frame_received(&mut self) {
-        self.permit_ack_only = true;
+    pub fn ack_eliciting_frame_received(&mut self, now: Instant) -> Option<Instant> {
+        // TODO: This is wrong since it counts frames and not packets
+        trace!("ack_eliciting_frame_received at {:?}", now);
+        self.acks_since_last_sent = self.acks_since_last_sent.saturating_add(1);
+        self.latest_ack = Some(now);
+
+        if self.acks_since_last_sent >= 1 {
+            self.permit_ack_only = true;
+            self.force_ack_at = None;
+
+        } else if self.force_ack_at.is_none() {
+            self.force_ack_at = Some(now + std::time::Duration::from_millis(1));
+            trace!("Wantn to send ACK at {:?}", self.force_ack_at);
+        }
+        self.force_ack_at
     }
 
     /// Should be called whenever ACKs have been sent
@@ -447,6 +496,8 @@ impl PendingAcks {
         // is available in this space - because otherwise it would return
         // `true` purely due to the ACKs
         self.permit_ack_only = false;
+        self.acks_since_last_sent = 0;
+        self.force_ack_at = None;
     }
 
     /// Insert one packet that needs to be acknowledged
@@ -460,6 +511,11 @@ impl PendingAcks {
     /// Removes the given ACKs from the set of pending ACKs
     pub fn subtract(&mut self, acks: &ArrayRangeSet) {
         self.pending_acks.subtract(acks);
+        if self.pending_acks.is_empty() {
+            self.permit_ack_only = false;
+            self.acks_since_last_sent = 0;
+            self.force_ack_at = None;
+        }
     }
 
     /// Returns the set of currently pending ACK ranges

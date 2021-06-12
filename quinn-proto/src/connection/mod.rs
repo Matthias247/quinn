@@ -552,7 +552,7 @@ where
                     .path
                     .anti_amplification_blocked(self.path.mtu as u64 * (num_datagrams + 1) as u64)
                 {
-                    trace!("blocked by anti-amplification");
+                    trace!("blocked by anti-amplification, recvd: {}, sent: {}", self.path.total_recvd, self.path.total_sent);
                     break;
                 }
 
@@ -702,11 +702,12 @@ where
                 break;
             }
 
-            let sent = self.populate_packet(space_id, &mut buf, buf_capacity - builder.tag_len);
+            let sent = self.populate_packet(now, space_id, &mut buf, buf_capacity - builder.tag_len);
             pad_datagram |= sent.requires_padding;
 
             if !sent.acks.is_empty() {
                 self.spaces[space_id].pending_acks.acks_sent();
+                self.timers.stop(Timer::DelayedAck);
             }
 
             // Keep information about the packet around until it gets finalized
@@ -825,8 +826,9 @@ where
             }
             NewIdentifiers(ids, now) => {
                 self.local_cid_state.new_cids(&ids, now);
-                ids.into_iter().rev().for_each(|frame| {
-                    self.spaces[SpaceId::Data].pending.new_cids.push(frame);
+                ids.into_iter().for_each(|frame| {
+                    trace!("Pushing new CID frame {:?}", frame);
+                    self.spaces[SpaceId::Data].pending.new_cids.push_back(frame);
                 });
                 // Update Timer::PushNewCid
                 if self
@@ -895,6 +897,12 @@ where
                         self.endpoint_events
                             .push_back(EndpointEventInner::NeedIdentifiers(now, num_new_cid));
                     }
+                }
+                Timer::DelayedAck => {
+                    trace!("DelayedAck timer expired");
+                    // for space in SpaceId::iter() {
+                        self.spaces[SpaceId::Data].pending_acks.ack_timer_expired();
+                    // }
                 }
             }
         }
@@ -1094,6 +1102,7 @@ where
                     Duration::from_micros(ack.delay << self.peer_params.ack_delay_exponent.0),
                 )
             };
+            trace!("Peer ack delay: {:?}", ack_delay);
             let rtt = instant_saturating_sub(now, self.spaces[space].largest_acked_packet_sent);
             self.path.rtt.update(ack_delay, rtt);
         }
@@ -1245,6 +1254,7 @@ where
         for (&packet, info) in space.sent_packets.range(0..largest_acked_packet) {
             if info.time_sent <= lost_send_time || largest_acked_packet >= packet + packet_threshold
             {
+                // panic!("packet {} was lost", packet);
                 lost_packets.push(packet);
             } else {
                 let next_loss_time = info.time_sent + loss_delay;
@@ -1350,6 +1360,12 @@ where
     }
 
     fn set_loss_detection_timer(&mut self, now: Instant) {
+        if let Some(timer) = self.spaces[self.highest_space].pending_acks.ack_timer() {
+            self.timers.set(Timer::DelayedAck, timer);
+        } else {
+            self.timers.stop(Timer::DelayedAck);
+        }
+
         if let Some((loss_time, _)) = self.loss_time_and_space() {
             // Time threshold loss detection.
             self.timers.set(Timer::LossDetection, loss_time);
@@ -1434,6 +1450,8 @@ where
             return;
         }
         let dt = cmp::max(timeout, 3 * self.pto());
+        trace!("Timeout is {:?}, pto is {:?}, dt is {:?}",
+            timeout, self.pto(), dt);
         self.timers.set(Timer::Idle, now + dt);
     }
 
@@ -1641,6 +1659,7 @@ where
         space.crypto = None;
         space.time_of_last_ack_eliciting_packet = None;
         space.loss_time = None;
+        space.pending_acks.ack_timer_expired();
         let sent_packets = mem::take(&mut space.sent_packets);
         for (_, packet) in sent_packets.into_iter() {
             self.remove_in_flight(space_id, &packet);
@@ -2124,9 +2143,20 @@ where
             match frame {
                 Frame::Ack(_) | Frame::Padding | Frame::Close(Close::Connection(_)) => {}
                 _ => {
-                    self.spaces[packet.header.space()]
+                    if let Some(ack_timer) = self.spaces[packet.header.space()]
                         .pending_acks
-                        .ack_eliciting_frame_received();
+                        .ack_eliciting_frame_received(now)
+                    {
+                        if packet.header.space() == SpaceId::Data && self.path.validated() {
+                            self.timers.set(Timer::DelayedAck, ack_timer);
+                        } else {
+                            self.spaces[packet.header.space()]
+                        .pending_acks.ack_timer_expired();
+                        self.timers.stop(Timer::DelayedAck);
+                        }
+                    } else if packet.header.space() == SpaceId::Data {
+                        self.timers.stop(Timer::DelayedAck);
+                    }
                 }
             }
             // Process frames
@@ -2212,16 +2242,27 @@ where
             match frame {
                 Frame::Ack(_) | Frame::Padding | Frame::Close(_) => {}
                 _ => {
-                    self.spaces[SpaceId::Data]
+                    if let Some(ack_timer) = self.spaces[SpaceId::Data]
                         .pending_acks
-                        .ack_eliciting_frame_received();
+                        .ack_eliciting_frame_received(now)
+                    {
+                        if self.path.validated() {
+                            self.timers.set(Timer::DelayedAck, ack_timer);
+                        } else {
+                            self.spaces[SpaceId::Data]
+                        .pending_acks.ack_timer_expired();
+                        self.timers.stop(Timer::DelayedAck);
+                        }
+                    } else {
+                        self.timers.stop(Timer::DelayedAck);
+                    }
                 }
             }
             // Check whether this could be a probing packet
             match frame {
                 Frame::Padding
                 | Frame::PathChallenge(_)
-                | Frame::PathResponse(_)
+                | Frame::PathResponse(_) => {}
                 | Frame::NewConnectionId(_) => {}
                 _ => {
                     is_probing_packet = false;
@@ -2446,9 +2487,15 @@ where
         }
 
         if let Some(reason) = close {
+            if self.error.is_some() || self.close || !matches!(self.state, State::Established) {
+                panic!("Got a close frame. Current error: {:?}, Current state: {:?}, Current close: {:?}", self.error, self.state, self.close);
+            }
+            assert!(self.error.is_none());
             self.error = Some(reason.into());
             self.state = State::Draining;
+            assert!(self.close == false);
             self.close = true;
+
         }
 
         if remote != self.path.remote
@@ -2492,7 +2539,7 @@ where
 
         let mut prev = mem::replace(&mut self.path, new_path);
         // Don't clobber the original path if the previous one hasn't been validated yet
-        if prev.challenge.is_none() {
+        if prev.challenge.is_none() && !prev.validated {
             prev.challenge = Some(self.rng.gen());
             prev.challenge_pending = true;
             self.prev_path = Some(prev);
@@ -2502,6 +2549,7 @@ where
             Timer::PathValidation,
             now + 3 * cmp::max(self.pto(), prev_pto),
         );
+        self.spaces[self.highest_space].pending_acks.ack_timer_expired();
     }
 
     /// Returns Err(()) if no CIDs were available
@@ -2510,6 +2558,7 @@ where
 
         // Retire the current remote CID and any CIDs we had to skip.
         let retire_cids = &mut self.spaces[SpaceId::Data].pending.retire_cids;
+        trace!("Pushing {:?} into retire_cids. Old was {:?}", retired, retire_cids);
         retire_cids.extend(retired);
 
         self.endpoint_events
@@ -2538,6 +2587,7 @@ where
 
     fn populate_packet(
         &mut self,
+        now: Instant,
         space_id: SpaceId,
         buf: &mut Vec<u8>,
         max_size: usize,
@@ -2564,16 +2614,28 @@ where
 
         // ACK
         // 0-RTT packets must never carry acks (which would have to be of handshake packets)
-        if !space.pending_acks.ranges().is_empty() {
+        if space.pending_acks.can_send() {
             debug_assert!(space.crypto.is_some(), "tried to send ACK in 0-RTT");
-            trace!("ACK");
             let ecn = if self.receiving_ecn {
                 Some(&space.ecn_counters)
             } else {
                 None
             };
             sent.acks = space.pending_acks.ranges().clone();
-            frame::Ack::encode(0, &sent.acks, ecn, buf);
+            trace!("ACK {:?}", sent.acks);
+            let delay_micros = now.saturating_duration_since(space.pending_acks.latest_ack().unwrap()).as_micros() as u64;
+
+            let max_ack_delay = TransportParameters::default().max_ack_delay;
+            let ack_delay_exp = TransportParameters::default().ack_delay_exponent;
+            let delay = delay_micros >> ack_delay_exp.into_inner();
+
+            // cmp::min(
+            //     self.max_ack_delay(),
+            //     Duration::from_micros(ack.delay << self.peer_params.ack_delay_exponent.0),
+            // )
+            trace!("Max: {:?}, Exp: {:?}, Ack is delayed by {:?}", max_ack_delay, ack_delay_exp, delay_micros);
+
+            frame::Ack::encode(delay as _, &sent.acks, ecn, buf);
             self.stats.frame_tx.acks += 1;
         }
 
@@ -2656,7 +2718,7 @@ where
 
         // NEW_CONNECTION_ID
         while buf.len() + 44 < max_size {
-            let issued = match space.pending.new_cids.pop() {
+            let issued = match space.pending.new_cids.pop_front() {
                 Some(x) => x,
                 None => break,
             };
@@ -2672,7 +2734,7 @@ where
                 reset_token: issued.reset_token,
             }
             .encode(buf);
-            sent.retransmits.get_or_create().new_cids.push(issued);
+            sent.retransmits.get_or_create().new_cids.push_back(issued);
             self.stats.frame_tx.new_connection_id += 1;
         }
 
@@ -2682,7 +2744,7 @@ where
                 Some(x) => x,
                 None => break,
             };
-            trace!(sequence = seq, "RETIRE_CONNECTION_ID");
+            trace!(sequence = seq, "RETIRE_CONNECTION_ID. Pending = {:?}", pending = space.pending.retire_cids);
             buf.write(frame::Type::RETIRE_CONNECTION_ID);
             buf.write_var(seq);
             sent.retransmits.get_or_create().retire_cids.push(seq);
@@ -2735,7 +2797,8 @@ where
 
     fn set_peer_params(&mut self, params: TransportParameters) {
         self.streams.set_params(&params);
-        self.idle_timeout = match (self.config.max_idle_timeout, params.max_idle_timeout.0) {
+        trace!("self.config.max_idle_timeout: {:?}, params.max_idle_timeout: {:?}", self.config.max_idle_timeout, params.max_idle_timeout.0);
+        self.idle_timeout = match (dbg!(self.config.max_idle_timeout), dbg!(params.max_idle_timeout.0)) {
             (None, 0) => None,
             (None, x) => Some(Duration::from_millis(x)),
             (Some(x), 0) => Some(x),
@@ -3018,7 +3081,7 @@ impl From<ConnectionError> for io::Error {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum State {
     Handshake(state::Handshake),
     Established,
@@ -3055,7 +3118,7 @@ impl State {
 mod state {
     use super::*;
 
-    #[derive(Clone)]
+    #[derive(Clone, Debug)]
     pub struct Handshake {
         /// Whether the remote CID has been set by the peer yet
         ///
@@ -3071,7 +3134,7 @@ mod state {
         pub client_hello: Option<Bytes>,
     }
 
-    #[derive(Clone)]
+    #[derive(Clone, Debug)]
     pub struct Closed {
         pub reason: Close,
     }

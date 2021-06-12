@@ -869,7 +869,7 @@ fn instant_close_2() {
 #[test]
 fn idle_timeout() {
     let _guard = subscribe();
-    const IDLE_TIMEOUT: Duration = Duration::from_millis(10);
+    const IDLE_TIMEOUT: Duration = Duration::from_millis(20);
     let server = ServerConfig {
         transport: Arc::new(TransportConfig {
             max_idle_timeout: Some(IDLE_TIMEOUT),
@@ -885,15 +885,20 @@ fn idle_timeout() {
     while !pair.client_conn_mut(client_ch).is_closed()
         || !pair.server_conn_mut(server_ch).is_closed()
     {
+        tracing::trace!("Current time: {:?}, Elapsed: {:?}", pair.time, pair.time - start);
         if !pair.step() {
             if let Some(t) = min_opt(pair.client.next_wakeup(), pair.server.next_wakeup()) {
+                tracing::warn!("Advancing time to {:?}", t);
                 pair.time = t;
             }
         }
+        tracing::warn!("Clearing client queue");
         pair.client.inbound.clear(); // Simulate total S->C packet loss
     }
 
-    assert!(pair.time - start < 2 * IDLE_TIMEOUT);
+    assert!(pair.time - start < 2 * IDLE_TIMEOUT, "expected pair time to be < {:?}, but got {:?}",
+        2 * IDLE_TIMEOUT,
+        pair.time - start);
     assert_matches!(
         pair.client_conn_mut(client_ch).poll(),
         Some(Event::ConnectionLost {
@@ -958,6 +963,7 @@ fn migration() {
     let _guard = subscribe();
     let mut pair = Pair::default();
     let (client_ch, server_ch) = pair.connect();
+    tracing::error!("Connected!");
     pair.client.addr = SocketAddr::new(
         Ipv4Addr::new(127, 0, 0, 1).into(),
         CLIENT_PORTS.lock().unwrap().next().unwrap(),
@@ -976,6 +982,7 @@ fn migration() {
         pair.server_conn_mut(server_ch).remote_address(),
         pair.client.addr
     );
+    panic!("ABC");
 }
 
 fn test_flow_control(config: TransportConfig, window_size: usize) {

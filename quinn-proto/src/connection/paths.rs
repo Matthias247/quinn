@@ -71,7 +71,16 @@ impl PathData {
     /// Indicates whether we're a server that hasn't validated the peer's address and hasn't
     /// received enough data from the peer to permit sending `bytes_to_send` additional bytes
     pub fn anti_amplification_blocked(&self, bytes_to_send: u64) -> bool {
+        tracing::trace!(
+            "anti-amplification check, recvd: {}, sent: {}",
+            self.total_recvd,
+            self.total_sent
+        );
         !self.validated && self.total_recvd * 3 < self.total_sent + bytes_to_send
+    }
+
+    pub fn validated(&self) -> bool {
+        self.validated
     }
 }
 

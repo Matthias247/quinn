@@ -92,9 +92,13 @@ impl Pair {
     }
 
     pub fn drive_client(&mut self) {
-        let span = info_span!("client");
-        let _guard = span.enter();
+        let span_normal = info_span!("client");
+        let span_hs = info_span!("client_hs");
+        let _guard = if self.client.is_handshaking() { span_hs.enter() } else { span_normal.enter() };
+        trace!("drive_client at {:?}", self.time);
+        // let _guard = span.enter();
         self.client.drive(self.time, self.server.addr);
+        
         for x in self.client.outbound.drain(..) {
             if x.contents[0] & packet::LONG_HEADER_FORM == 0 {
                 let spin = x.contents[0] & packet::SPIN_BIT != 0;
@@ -323,6 +327,10 @@ impl TestEndpoint {
 
     fn is_idle(&self) -> bool {
         self.connections.values().all(|x| x.is_idle())
+    }
+
+    fn is_handshaking(&self) -> bool {
+        self.connections.values().all(|x| x.is_handshaking())
     }
 
     pub fn delay_outbound(&mut self) {

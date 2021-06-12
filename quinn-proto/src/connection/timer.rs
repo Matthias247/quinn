@@ -18,10 +18,12 @@ pub(crate) enum Timer {
     Pacing = 6,
     /// When to invalidate old CID and proactively push new one via NEW_CONNECTION_ID frame
     PushNewCid = 7,
+    /// Send delayed ACKs
+    DelayedAck = 8,
 }
 
 impl Timer {
-    pub(crate) const VALUES: [Self; 8] = [
+    pub(crate) const VALUES: [Self; 9] = [
         Timer::LossDetection,
         Timer::Idle,
         Timer::Close,
@@ -30,17 +32,21 @@ impl Timer {
         Timer::KeepAlive,
         Timer::Pacing,
         Timer::PushNewCid,
+        Timer::DelayedAck,
     ];
 }
 
 /// A table of data associated with each distinct kind of `Timer`
 #[derive(Debug, Copy, Clone, Default)]
 pub(crate) struct TimerTable {
-    data: [Option<Instant>; 8],
+    data: [Option<Instant>; 9],
 }
 
 impl TimerTable {
     pub fn set(&mut self, timer: Timer, time: Instant) {
+        if timer == Timer::Idle {
+            tracing::warn!("Setting idle timer to {:?}", time);
+        }
         self.data[timer as usize] = Some(time);
     }
 
@@ -59,4 +65,19 @@ impl TimerTable {
     pub fn is_expired(&self, timer: Timer, after: Instant) -> bool {
         self.data[timer as usize].map_or(false, |x| x <= after)
     }
+}
+
+#[test]
+fn timer_test() {
+    let a = Instant::now();
+    let b = a + std::time::Duration::from_millis(1);
+    
+    let mut table = TimerTable::default();
+    table.set(Timer::DelayedAck, b);
+    assert_eq!(table.next_timeout(), Some(b));
+
+    table.set(Timer::KeyDiscard, a);
+    assert_eq!(table.next_timeout(), Some(a));
+    table.stop(Timer::KeyDiscard);
+    assert_eq!(table.next_timeout(), Some(b));
 }

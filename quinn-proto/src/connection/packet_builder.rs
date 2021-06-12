@@ -194,6 +194,7 @@ impl PacketBuilder {
             if ack_eliciting {
                 conn.spaces[space_id].time_of_last_ack_eliciting_packet = Some(now);
                 if conn.permit_idle_reset {
+                    tracing::warn!("Permitting idle reset");
                     conn.reset_idle_timeout(now);
                 }
                 conn.permit_idle_reset = false;
